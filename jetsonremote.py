@@ -1,6 +1,8 @@
+import argparse
 import json
 import heapq
 import math
+import os
 import threading
 import time
 from typing import Optional
@@ -30,6 +32,7 @@ CAMERA_STREAM_FPS = 10.0
 CAMERA_JPEG_QUALITY = 70
 AUX_CAMERA_RETRY_SECONDS = 2.0
 TELEMETRY_PUBLISH_INTERVAL_SECONDS = 0.2
+HEADLESS_STATUS_PRINT_INTERVAL_SECONDS = 5.0
 
 LIDAR_SERIAL_PORT = "/dev/ttyUSB0"
 LIDAR_SERIAL_BAUDRATE = 230400
@@ -1370,6 +1373,38 @@ def open_camera_capture(camera_index: int, label: str, required: bool) -> Option
     return cap
 
 
+def parse_runtime_args():
+    parser = argparse.ArgumentParser(
+        description="Jetson Nano robot bridge with optional headless mode for SSH use."
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Disable the OpenCV preview window. Recommended for SSH/headless runs.",
+    )
+    parser.add_argument(
+        "--display",
+        action="store_true",
+        help="Force the OpenCV preview window even if no DISPLAY environment variable is set.",
+    )
+    return parser.parse_args()
+
+
+def should_run_headless(args) -> bool:
+    if args.headless:
+        return True
+    if args.display:
+        return False
+
+    env_value = os.environ.get("JETSON_HEADLESS", "").strip().lower()
+    if env_value in {"1", "true", "yes", "on"}:
+        return True
+    if env_value in {"0", "false", "no", "off"}:
+        return False
+
+    return not bool(os.environ.get("DISPLAY"))
+
+
 def build_target_records(marker_corners, marker_ids):
     records = []
     if marker_ids is None or len(marker_ids) == 0:
@@ -1403,10 +1438,13 @@ def choose_active_target(records, selected_target_id):
 
 
 def main():
+    args = parse_runtime_args()
+    headless_mode = should_run_headless(args)
     command_state = CommandState()
     telemetry_parser = TelemetryParser()
     last_camera_publish_time = 0.0
     last_telemetry_publish_time = 0.0
+    last_headless_status_print_time = 0.0
     last_route_update_id = -1
     lidar_reader = LidarReader()
     planner = JetsonRoutePlanner()
@@ -1464,7 +1502,10 @@ def main():
     lidar_reader.start()
 
     print("Starting ArUco detection + dual-camera MQTT streaming + UART...")
-    print("Press 'q' to stop")
+    if headless_mode:
+        print("Running in headless mode. Stop with Ctrl+C.")
+    else:
+        print("Running with preview window. Press 'q' to stop.")
 
     aruco, dictionary, params, detector = get_aruco_detector()
 
@@ -1662,16 +1703,32 @@ def main():
                             mqtt_client.publish(MQTT_TOPIC_CAMERA_AUX, aux_payload)
                     last_camera_publish_time = now
 
+            if headless_mode:
+                if now - last_headless_status_print_time >= HEADLESS_STATUS_PRINT_INTERVAL_SECONDS:
+                    active_target_text = active_target["id"] if active_target is not None else "--"
+                    print(
+                        "Headless status | "
+                        f"cmd={active_control['label']} "
+                        f"targets={len(target_records)} "
+                        f"active={active_target_text} "
+                        f"state={latest_telemetry.get('robot_state', STATE_MANUAL)}"
+                    )
+                    last_headless_status_print_time = now
+                continue
+
             cv2.imshow("Jetson Remote - ArUco + MQTT + UART", frame)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
+    except KeyboardInterrupt:
+        print("Stopping Jetson remote...")
     finally:
         lidar_reader.stop()
         aiming_cap.release()
         if aux_cap is not None:
             aux_cap.release()
-        cv2.destroyAllWindows()
+        if not headless_mode:
+            cv2.destroyAllWindows()
         ser.close()
         if mqtt_client is not None:
             mqtt_client.loop_stop()
