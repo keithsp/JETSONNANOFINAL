@@ -80,9 +80,9 @@ ROUTE_PACKET_START = 0x30
 ROUTE_PACKET_END = 0x31
 FRONT_OBSTACLE_LIMIT_CM = 120
 SIDE_CLEAR_LIMIT_CM = 140
-FRONT_OBSTACLE_DEGREES = tuple(range(0, 19)) + tuple(range(341, 360))
+FRONT_OBSTACLE_DEGREES = tuple(range(0, 19))
 LEFT_CLEAR_DEGREES = tuple(range(25, 81))
-RIGHT_CLEAR_DEGREES = tuple(range(280, 336))
+RIGHT_CLEAR_DEGREES = tuple()
 
 PLANNER_ENABLED = True
 PLANNER_GRID_CELL_CM = 25.0
@@ -535,6 +535,14 @@ def extract_valid_distances(scan, degree_indices):
     return distances
 
 
+def lidar_degree_allowed_for_nav(degree: int) -> bool:
+    try:
+        degree = int(degree) % 360
+    except (TypeError, ValueError):
+        return False
+    return not (270 <= degree <= 359)
+
+
 def compute_obstacle_flags(scan):
     front_distances = extract_valid_distances(scan, FRONT_OBSTACLE_DEGREES)
     left_distances = extract_valid_distances(scan, LEFT_CLEAR_DEGREES)
@@ -854,6 +862,8 @@ class JetsonRoutePlanner:
         inflation_cells = max(1, int(math.ceil(PLANNER_OBSTACLE_INFLATION_CM / PLANNER_GRID_CELL_CM)))
 
         for degree, distance_cm in enumerate((lidar_scan or [])[:360]):
+            if not lidar_degree_allowed_for_nav(degree):
+                continue
             if distance_cm is None:
                 continue
             try:
@@ -966,6 +976,8 @@ class JetsonRoutePlanner:
         check_distance_cm = min(goal_distance_cm, PLANNER_BYPASS_LOOKAHEAD_CM)
 
         for degree, distance_cm in enumerate((lidar_scan or [])[:360]):
+            if not lidar_degree_allowed_for_nav(degree):
+                continue
             if distance_cm is None:
                 continue
             try:
