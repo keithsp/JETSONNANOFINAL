@@ -89,7 +89,7 @@ LEFT_WALL_TRACK_DEGREES = tuple(range(70, 111))
 LEFT_WALL_NEAR_CM = 30
 LEFT_WALL_CLEAR_CM = 55
 
-PLANNER_ENABLED = True
+PLANNER_ENABLED = False
 PLANNER_GRID_CELL_CM = 25.0
 PLANNER_GRID_SIZE = 57
 PLANNER_MAX_RANGE_CM = 700.0
@@ -1072,6 +1072,17 @@ class JetsonRoutePlanner:
         packets.append(build_route_packet(ROSM_CMD_ROUTE_COMMIT))
         return packets
 
+    def build_remaining_mission_route(self):
+        route_points = []
+        for waypoint in self.mission_waypoints[self.active_goal_index : self.active_goal_index + PLANNER_MAX_ROUTE_POINTS]:
+            route_points.append(
+                {
+                    "x_cm": float(waypoint["x_cm"]),
+                    "y_cm": float(waypoint["y_cm"]),
+                }
+            )
+        return route_points
+
     def update(self, control_state: dict, telemetry: dict, lidar_scan, now: float):
         self.update_command_state(control_state)
         pose = self.robot_pose_from_telemetry(telemetry)
@@ -1199,7 +1210,7 @@ class JetsonRoutePlanner:
 
         path_world = [self.cell_to_world(origin_x_cm, origin_y_cm, cell) for cell in path_cells]
         self.last_path_world = [{"x_cm": point[0], "y_cm": point[1]} for point in path_world]
-        route_points = self.simplify_world_path(path_world, goal)
+        route_points = self.build_remaining_mission_route()
         self.last_status = "tracking"
 
         result.update(
