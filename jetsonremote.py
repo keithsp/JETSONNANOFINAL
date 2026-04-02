@@ -107,6 +107,13 @@ PLANNER_BYPASS_FORWARD_CM = 170.0
 PLANNER_BYPASS_LATERAL_CM = 130.0
 PLANNER_BYPASS_CLEARANCE_CM = 85.0
 PLANNER_BYPASS_PATH_ANGLE_DEG = 24.0
+OCCUPANCY_MAP_ENABLED = True
+OCCUPANCY_MAP_FRONT_ONLY = False
+OCCUPANCY_MAP_ANGLE_STEP_DEG = 2
+OCCUPANCY_MAP_CELL_CM = 10.0
+OCCUPANCY_MAP_SIZE_CELLS = 260
+OCCUPANCY_MAP_MAX_OCCUPIED_POINTS = 1800
+OCCUPANCY_MAP_OCCUPIED_LOG_ODDS_THRESHOLD = 0.7
 
 STATE_MANUAL = "MANUAL"
 STATE_AUTO_PATROLLING = "AUTO_PATROLLING"
@@ -231,6 +238,19 @@ class LidarReader:
                 value if value is not None and (now - stamp) <= 1.0 else None
                 for value, stamp in zip(self._scan, self._scan_time)
             ]
+
+    def get_scan_snapshot_with_timestamp(self):
+        now = time.time()
+        with self._lock:
+            snapshot = [
+                value if value is not None and (now - stamp) <= 1.0 else None
+                for value, stamp in zip(self._scan, self._scan_time)
+            ]
+            latest_timestamp = 0.0
+            for stamp in self._scan_time:
+                if (now - stamp) <= 1.0 and stamp > latest_timestamp:
+                    latest_timestamp = stamp
+        return snapshot, latest_timestamp
 
     def _read_loop(self):
         while self._running and self._serial is not None:
@@ -590,6 +610,141 @@ def normalize_angle_deg(angle_deg: float) -> float:
     while angle <= -180.0:
         angle += 360.0
     return angle
+
+
+def local_to_world_vector(local_x_cm: float, local_y_cm: float, yaw_deg: float):
+    yaw_rad = math.radians(float(yaw_deg))
+    world_dx_cm = (math.cos(yaw_rad) * local_x_cm) - (math.sin(yaw_rad) * local_y_cm)
+    world_dy_cm = (math.sin(yaw_rad) * local_x_cm) + (math.cos(yaw_rad) * local_y_cm)
+    return world_dx_cm, world_dy_cm
+
+
+def lidar_snapshot_to_local_points(scan, max_range_cm: float, front_only: bool, angle_step_deg: int):
+    points = []
+    for degree, distance_cm in enumerate((scan or [])[:360]):
+        if distance_cm is None:
+            continue
+        if front_only and not (degree <= 90 or degree >= 270):
+            continue
+        if angle_step_deg > 1 and (degree % angle_step_deg) != 0:
+            continue
+
+        try:
+            distance = float(distance_cm)
+        except (TypeError, ValueError):
+            continue
+        if distance <= 0.0 or distance > max_range_cm:
+            continue
+
+        radians = math.radians(float(degree))
+        local_x_cm = -math.sin(radians) * distance
+        local_y_cm = math.cos(radians) * distance
+        points.append((local_x_cm, local_y_cm))
+    return points
+
+
+class PersistentOccupancyMap:
+    def __init__(self, size_cells: int, cell_cm: float):
+        self.size_cells = int(size_cells)
+        self.cell_cm = float(cell_cm)
+        self.log_odds = [0.0] * (self.size_cells * self.size_cells)
+        self.origin_x_cm = -(self.size_cells * self.cell_cm * 0.5)
+        self.origin_y_cm = -(self.size_cells * self.cell_cm * 0.5)
+        self.seeded = False
+        self.hit_log_odds = 0.9
+        self.free_log_odds = -0.2
+        self.max_log_odds = 3.5
+        self.min_log_odds = -3.5
+
+    def seed_origin_from_pose(self, x_cm: float, y_cm: float):
+        if self.seeded:
+            return
+        half_span_cm = (self.size_cells * self.cell_cm) * 0.5
+        self.origin_x_cm = float(x_cm) - half_span_cm
+        self.origin_y_cm = float(y_cm) - half_span_cm
+        self.seeded = True
+
+    def world_to_cell(self, x_cm: float, y_cm: float):
+        cell_x = int(math.floor((float(x_cm) - self.origin_x_cm) / self.cell_cm))
+        cell_y = int(math.floor((float(y_cm) - self.origin_y_cm) / self.cell_cm))
+        if 0 <= cell_x < self.size_cells and 0 <= cell_y < self.size_cells:
+            return (cell_x, cell_y)
+        return None
+
+    def cell_to_world(self, cell):
+        return (
+            self.origin_x_cm + ((cell[0] + 0.5) * self.cell_cm),
+            self.origin_y_cm + ((cell[1] + 0.5) * self.cell_cm),
+        )
+
+    def update_from_scan(self, pose, local_points):
+        robot_cell = self.world_to_cell(pose[0], pose[1])
+        if robot_cell is None:
+            return
+
+        for local_x_cm, local_y_cm in local_points:
+            world_dx_cm, world_dy_cm = local_to_world_vector(local_x_cm, local_y_cm, pose[2])
+            end_cell = self.world_to_cell(pose[0] + world_dx_cm, pose[1] + world_dy_cm)
+            if end_cell is None:
+                continue
+
+            ray_cells = self._bresenham(robot_cell[0], robot_cell[1], end_cell[0], end_cell[1])
+            if len(ray_cells) <= 1:
+                continue
+
+            for free_cell in ray_cells[:-1]:
+                self._add_log_odds(free_cell[0], free_cell[1], self.free_log_odds)
+            self._add_log_odds(end_cell[0], end_cell[1], self.hit_log_odds)
+
+    def export_occupied_world_points(self, max_points: int, threshold: float):
+        occupied = []
+        for y_idx in range(self.size_cells):
+            row_offset = y_idx * self.size_cells
+            for x_idx in range(self.size_cells):
+                if self.log_odds[row_offset + x_idx] >= threshold:
+                    world_x_cm, world_y_cm = self.cell_to_world((x_idx, y_idx))
+                    occupied.append({"x_cm": round(world_x_cm, 1), "y_cm": round(world_y_cm, 1)})
+
+        if len(occupied) <= max_points:
+            return occupied
+
+        stride = max(1, int(math.ceil(len(occupied) / float(max_points))))
+        reduced = occupied[::stride]
+        if len(reduced) > max_points:
+            reduced = reduced[:max_points]
+        return reduced
+
+    def _add_log_odds(self, x_idx: int, y_idx: int, delta: float):
+        index = (y_idx * self.size_cells) + x_idx
+        next_value = self.log_odds[index] + delta
+        if next_value > self.max_log_odds:
+            next_value = self.max_log_odds
+        elif next_value < self.min_log_odds:
+            next_value = self.min_log_odds
+        self.log_odds[index] = next_value
+
+    def _bresenham(self, x0: int, y0: int, x1: int, y1: int):
+        cells = []
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        step_x = 1 if x0 < x1 else -1
+        step_y = 1 if y0 < y1 else -1
+        error = dx + dy
+        x_value = x0
+        y_value = y0
+
+        while True:
+            cells.append((x_value, y_value))
+            if x_value == x1 and y_value == y1:
+                break
+            error_twice = 2 * error
+            if error_twice >= dy:
+                error += dy
+                x_value += step_x
+            if error_twice <= dx:
+                error += dx
+                y_value += step_y
+        return cells
 
 
 def world_distance_cm(a, b) -> float:
@@ -1483,6 +1638,8 @@ def main():
     last_route_update_id = -1
     lidar_reader = LidarReader()
     planner = JetsonRoutePlanner()
+    occupancy_map = PersistentOccupancyMap(OCCUPANCY_MAP_SIZE_CELLS, OCCUPANCY_MAP_CELL_CM)
+    last_lidar_scan_timestamp = 0.0
     latest_telemetry = {
         "robot_state": STATE_MANUAL,
         "robot_state_enum": STATE_MANUAL,
@@ -1498,6 +1655,24 @@ def main():
         "planner_status": "idle",
         "planner_path_age_s": 0.0,
         "planner_obstacle_count": 0,
+        "mapping": {
+            "enabled": bool(OCCUPANCY_MAP_ENABLED),
+            "status": "idle",
+            "pose_x_cm": 0.0,
+            "pose_y_cm": 0.0,
+            "pose_yaw_deg": 0.0,
+            "seeded": False,
+            "seeded_from_stm32": True,
+            "match_score": 1.0,
+            "delta_x_cm": 0.0,
+            "delta_y_cm": 0.0,
+            "delta_yaw_deg": 0.0,
+            "cell_cm": float(OCCUPANCY_MAP_CELL_CM),
+            "occupied_points_world": [],
+            "occupied_count": 0,
+            "front_only": bool(OCCUPANCY_MAP_FRONT_ONLY),
+            "timestamp": 0.0,
+        },
     }
 
     def on_connect(client, userdata, flags, reason_code, properties):
@@ -1598,7 +1773,7 @@ def main():
             target_records = build_target_records(marker_corners, marker_ids)
             selected_target_id = active_control.get("selected_target_id")
             active_target = choose_active_target(target_records, selected_target_id)
-            lidar_scan_snapshot = lidar_reader.get_scan_snapshot()
+            lidar_scan_snapshot, lidar_scan_timestamp = lidar_reader.get_scan_snapshot_with_timestamp()
             obstacle_flags = compute_obstacle_flags(lidar_scan_snapshot)
             planner_update = planner.update(active_control, latest_telemetry, lidar_scan_snapshot, now)
             latest_telemetry.update(
@@ -1611,6 +1786,61 @@ def main():
                     "planner_obstacle_count": planner_update.get("planner_obstacle_count", 0),
                 }
             )
+
+            if OCCUPANCY_MAP_ENABLED:
+                mapping_payload = dict(latest_telemetry.get("mapping", {}))
+                try:
+                    pose_x_cm = float(latest_telemetry.get("x_cm", 0.0))
+                    pose_y_cm = float(latest_telemetry.get("y_cm", 0.0))
+                    pose_yaw_deg = normalize_angle_deg(float(latest_telemetry.get("yaw_deg", 0.0)))
+                    pose_valid = True
+                except (TypeError, ValueError):
+                    pose_x_cm = 0.0
+                    pose_y_cm = 0.0
+                    pose_yaw_deg = 0.0
+                    pose_valid = False
+
+                if pose_valid and not occupancy_map.seeded:
+                    occupancy_map.seed_origin_from_pose(pose_x_cm, pose_y_cm)
+
+                if pose_valid and lidar_scan_timestamp > last_lidar_scan_timestamp:
+                    local_points = lidar_snapshot_to_local_points(
+                        lidar_scan_snapshot,
+                        float(LIDAR_MAX_DISTANCE_CM),
+                        bool(OCCUPANCY_MAP_FRONT_ONLY),
+                        int(OCCUPANCY_MAP_ANGLE_STEP_DEG),
+                    )
+                    occupancy_map.update_from_scan((pose_x_cm, pose_y_cm, pose_yaw_deg), local_points)
+                    last_lidar_scan_timestamp = lidar_scan_timestamp
+                    mapping_payload["status"] = "tracking" if local_points else "waiting_scan"
+                    mapping_payload["occupied_points_world"] = occupancy_map.export_occupied_world_points(
+                        OCCUPANCY_MAP_MAX_OCCUPIED_POINTS,
+                        OCCUPANCY_MAP_OCCUPIED_LOG_ODDS_THRESHOLD,
+                    )
+                    mapping_payload["occupied_count"] = len(mapping_payload.get("occupied_points_world", []))
+                    mapping_payload["timestamp"] = now
+                elif pose_valid:
+                    mapping_payload["status"] = "tracking" if occupancy_map.seeded else "waiting_pose"
+                else:
+                    mapping_payload["status"] = "waiting_pose"
+
+                mapping_payload.update(
+                    {
+                        "enabled": True,
+                        "pose_x_cm": round(pose_x_cm, 1),
+                        "pose_y_cm": round(pose_y_cm, 1),
+                        "pose_yaw_deg": round(pose_yaw_deg, 1),
+                        "seeded": bool(occupancy_map.seeded),
+                        "seeded_from_stm32": True,
+                        "match_score": 1.0 if pose_valid else 0.0,
+                        "delta_x_cm": 0.0,
+                        "delta_y_cm": 0.0,
+                        "delta_yaw_deg": 0.0,
+                        "cell_cm": float(OCCUPANCY_MAP_CELL_CM),
+                        "front_only": bool(OCCUPANCY_MAP_FRONT_ONLY),
+                    }
+                )
+                latest_telemetry["mapping"] = mapping_payload
 
             if active_control.get("route_update_id", -1) != last_route_update_id:
                 route_packets = planner_update.get("route_packets", []) if PLANNER_ENABLED else build_route_packets(active_control)
