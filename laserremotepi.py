@@ -83,6 +83,8 @@ ROSM_CAM_FLAG_OBS_BLOCKED = 0x02
 ROSM_CAM_FLAG_OBS_LEFT_CLEAR = 0x04
 ROSM_CAM_FLAG_OBS_RIGHT_CLEAR = 0x08
 ROSM_CAM_FLAG_OBS_PREFER_LEFT = 0x10
+ROSM_CAM_FLAG_OBS_LEFT_NEAR_WALL = 0x20
+ROSM_CAM_FLAG_OBS_LEFT_WALL_CLEAR = 0x40
 
 ROUTE_PACKET_LEN = 15
 ROUTE_PACKET_START = 0x30
@@ -92,6 +94,9 @@ SIDE_CLEAR_LIMIT_CM = 140
 FRONT_OBSTACLE_DEGREES = tuple(range(0, 19)) + tuple(range(341, 360))
 LEFT_CLEAR_DEGREES = tuple(range(25, 81))
 RIGHT_CLEAR_DEGREES = tuple(range(280, 336))
+LEFT_WALL_TRACK_DEGREES = tuple(range(70, 111))
+LEFT_WALL_NEAR_CM = 30
+LEFT_WALL_CLEAR_CM = 55
 
 PLANNER_ENABLED = True
 PLANNER_GRID_CELL_CM = 25.0
@@ -561,14 +566,17 @@ def compute_obstacle_flags(scan):
     front_distances = extract_valid_distances(scan, FRONT_OBSTACLE_DEGREES)
     left_distances = extract_valid_distances(scan, LEFT_CLEAR_DEGREES)
     right_distances = extract_valid_distances(scan, RIGHT_CLEAR_DEGREES)
+    left_wall_distances = extract_valid_distances(scan, LEFT_WALL_TRACK_DEGREES)
 
-    if not front_distances and not left_distances and not right_distances:
+    if not front_distances and not left_distances and not right_distances and not left_wall_distances:
         return 0
 
     flags = ROSM_CAM_FLAG_OBS_VALID
     front_blocked = bool(front_distances) and min(front_distances) <= FRONT_OBSTACLE_LIMIT_CM
     left_clear = bool(left_distances) and min(left_distances) >= SIDE_CLEAR_LIMIT_CM
     right_clear = bool(right_distances) and min(right_distances) >= SIDE_CLEAR_LIMIT_CM
+    left_wall_near = bool(left_wall_distances) and min(left_wall_distances) <= LEFT_WALL_NEAR_CM
+    left_wall_clear = (not left_wall_distances) or (min(left_wall_distances) >= LEFT_WALL_CLEAR_CM)
 
     if front_blocked:
         flags |= ROSM_CAM_FLAG_OBS_BLOCKED
@@ -576,6 +584,10 @@ def compute_obstacle_flags(scan):
         flags |= ROSM_CAM_FLAG_OBS_LEFT_CLEAR
     if right_clear:
         flags |= ROSM_CAM_FLAG_OBS_RIGHT_CLEAR
+    if left_wall_near:
+        flags |= ROSM_CAM_FLAG_OBS_LEFT_NEAR_WALL
+    if left_wall_clear:
+        flags |= ROSM_CAM_FLAG_OBS_LEFT_WALL_CLEAR
 
     left_score = sum(left_distances) / len(left_distances) if left_distances else 0.0
     right_score = sum(right_distances) / len(right_distances) if right_distances else 0.0
