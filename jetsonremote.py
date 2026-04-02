@@ -714,6 +714,30 @@ class PersistentOccupancyMap:
             reduced = reduced[:max_points]
         return reduced
 
+    def export_occupied_cells(self, max_points: int, threshold: float):
+        occupied = []
+        for y_idx in range(self.size_cells):
+            row_offset = y_idx * self.size_cells
+            for x_idx in range(self.size_cells):
+                log_odds = self.log_odds[row_offset + x_idx]
+                if log_odds >= threshold:
+                    occupied.append(
+                        {
+                            "x": int(x_idx),
+                            "y": int(y_idx),
+                            "log_odds": round(float(log_odds), 3),
+                        }
+                    )
+
+        if len(occupied) <= max_points:
+            return occupied
+
+        stride = max(1, int(math.ceil(len(occupied) / float(max_points))))
+        reduced = occupied[::stride]
+        if len(reduced) > max_points:
+            reduced = reduced[:max_points]
+        return reduced
+
     def _add_log_odds(self, x_idx: int, y_idx: int, delta: float):
         index = (y_idx * self.size_cells) + x_idx
         next_value = self.log_odds[index] + delta
@@ -1668,6 +1692,10 @@ def main():
             "delta_y_cm": 0.0,
             "delta_yaw_deg": 0.0,
             "cell_cm": float(OCCUPANCY_MAP_CELL_CM),
+            "origin_x_cm": 0.0,
+            "origin_y_cm": 0.0,
+            "size_cells": int(OCCUPANCY_MAP_SIZE_CELLS),
+            "occupied_cells": [],
             "occupied_points_world": [],
             "occupied_count": 0,
             "front_only": bool(OCCUPANCY_MAP_FRONT_ONLY),
@@ -1817,6 +1845,10 @@ def main():
                         OCCUPANCY_MAP_MAX_OCCUPIED_POINTS,
                         OCCUPANCY_MAP_OCCUPIED_LOG_ODDS_THRESHOLD,
                     )
+                    mapping_payload["occupied_cells"] = occupancy_map.export_occupied_cells(
+                        OCCUPANCY_MAP_MAX_OCCUPIED_POINTS,
+                        OCCUPANCY_MAP_OCCUPIED_LOG_ODDS_THRESHOLD,
+                    )
                     mapping_payload["occupied_count"] = len(mapping_payload.get("occupied_points_world", []))
                     mapping_payload["timestamp"] = now
                 elif pose_valid:
@@ -1837,6 +1869,9 @@ def main():
                         "delta_y_cm": 0.0,
                         "delta_yaw_deg": 0.0,
                         "cell_cm": float(OCCUPANCY_MAP_CELL_CM),
+                        "origin_x_cm": round(float(occupancy_map.origin_x_cm), 1),
+                        "origin_y_cm": round(float(occupancy_map.origin_y_cm), 1),
+                        "size_cells": int(occupancy_map.size_cells),
                         "front_only": bool(OCCUPANCY_MAP_FRONT_ONLY),
                     }
                 )
