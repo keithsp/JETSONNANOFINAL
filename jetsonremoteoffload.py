@@ -48,7 +48,7 @@ CONTROL_MSG_END = 0x31
 JETSON_STATUS_STX = 0xAA
 JETSON_STATUS_PKT_SIZE = 23
 JETSON_STATUS_EXT_STX = 0xAB
-JETSON_STATUS_EXT_PKT_SIZE = 25
+JETSON_STATUS_EXT_PKT_SIZE = 17
 
 ROSM_MOVE_FORWARD = 0x01
 ROSM_MOVE_BACKWARD = 0x02
@@ -184,6 +184,7 @@ class CommandState:
     def clear_route_action(self):
         with self._lock:
             self._state["route_action"] = "none"
+            self._state["waypoints"] = []
 
 
 class LidarReader:
@@ -535,30 +536,6 @@ def build_route_packets(control_state: dict):
         packets.append(build_route_packet(ROSM_CMD_ROUTE_COMMIT))
 
     return packets
-
-
-def calculate_route_signature(waypoints) -> int:
-    signature = 0xA55A
-    points = waypoints if isinstance(waypoints, list) else []
-
-    signature = (((signature << 5) | (signature >> 11)) & 0xFFFF) ^ (len(points) & 0xFF)
-
-    for waypoint in points:
-        if not isinstance(waypoint, dict):
-            continue
-        try:
-            x_cm = int(round(float(waypoint.get("x_cm", 0))))
-            y_cm = int(round(float(waypoint.get("y_cm", 0))))
-        except (TypeError, ValueError):
-            x_cm = 0
-            y_cm = 0
-
-        for value in (x_cm, y_cm):
-            value &= 0xFFFF
-            signature = (((signature << 5) | (signature >> 11)) & 0xFFFF) ^ (value & 0xFF)
-            signature = (((signature << 5) | (signature >> 11)) & 0xFFFF) ^ ((value >> 8) & 0xFF)
-
-    return signature & 0xFFFF
 
 
 def extract_valid_distances(scan, degree_indices):
