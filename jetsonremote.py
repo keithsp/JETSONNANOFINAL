@@ -112,6 +112,7 @@ PLANNER_BYPASS_FORWARD_CM = 170.0
 PLANNER_BYPASS_LATERAL_CM = 130.0
 PLANNER_BYPASS_CLEARANCE_CM = 85.0
 PLANNER_BYPASS_PATH_ANGLE_DEG = 24.0
+PLANNER_BYPASS_HOLD_SECONDS = 1.6
 
 STATE_MANUAL = "MANUAL"
 STATE_AUTO_PATROLLING = "AUTO_PATROLLING"
@@ -1096,6 +1097,10 @@ class JetsonRoutePlanner:
         self.last_path_world = []
         self.last_goal = None
         self.last_obstacle_count = 0
+        self.active_bypass_route_points = []
+        self.active_bypass_direction = None
+        self.active_bypass_until = 0.0
+        self.active_bypass_goal_signature = None
         self.enabled = PLANNER_ENABLED
 
     def update_command_state(self, control_state: dict):
@@ -1111,6 +1116,10 @@ class JetsonRoutePlanner:
             self.last_sent_route_points = []
             self.last_path_world = []
             self.last_goal = None
+            self.active_bypass_route_points = []
+            self.active_bypass_direction = None
+            self.active_bypass_until = 0.0
+            self.active_bypass_goal_signature = None
             if not self.mission_waypoints:
                 self.last_status = "idle"
 
@@ -1401,6 +1410,10 @@ class JetsonRoutePlanner:
             self.last_goal = None
             self.last_path_world = []
             self.last_obstacle_count = 0
+            self.active_bypass_route_points = []
+            self.active_bypass_direction = None
+            self.active_bypass_until = 0.0
+            self.active_bypass_goal_signature = None
             result.update(
                 {
                     "planner_status": self.last_status,
@@ -1452,11 +1465,54 @@ class JetsonRoutePlanner:
             "y_cm": float(goal["y_cm"]),
             "index": int(self.active_goal_index),
         }
+        current_goal_signature = (
+            self.last_goal["label"],
+            int(round(self.last_goal["x_cm"])),
+            int(round(self.last_goal["y_cm"])),
+        )
+
+        if (
+            self.active_bypass_route_points
+            and self.active_bypass_goal_signature == current_goal_signature
+            and now < self.active_bypass_until
+        ):
+            self.last_status = f"bypass_{self.active_bypass_direction}"
+            self.last_path_world = [{"x_cm": pose[0], "y_cm": pose[1]}] + list(self.active_bypass_route_points)
+            result.update(
+                {
+                    "planner_status": self.last_status,
+                    "planner_goal": dict(self.last_goal),
+                    "planner_path": list(self.last_path_world),
+                    "planner_path_age_s": 0.0,
+                    "planner_obstacle_count": int(self.last_obstacle_count),
+                }
+            )
+
+            route_signature = tuple((int(round(point["x_cm"])), int(round(point["y_cm"]))) for point in self.active_bypass_route_points)
+            if route_signature != self.last_sent_route_signature:
+                result["route_packets"] = self.build_route_packets_from_path(self.active_bypass_route_points)
+                self.last_sent_route_signature = route_signature
+                self.last_sent_route_points = list(self.active_bypass_route_points)
+                self.last_sent_route_time = now
+            elif (now - self.last_sent_route_time) >= PLANNER_ROUTE_RESEND_INTERVAL_SECONDS:
+                result["route_packets"] = self.build_route_packets_from_path(self.active_bypass_route_points)
+                self.last_sent_route_points = list(self.active_bypass_route_points)
+                self.last_sent_route_time = now
+            return result
+
+        if now >= self.active_bypass_until:
+            self.active_bypass_route_points = []
+            self.active_bypass_direction = None
+            self.active_bypass_goal_signature = None
 
         bypass_route_points, bypass_direction = self.build_temporary_bypass_route(pose, goal, lidar_scan, obstacle_points)
         if bypass_route_points:
             self.last_status = f"bypass_{bypass_direction}"
             self.last_path_world = [{"x_cm": pose[0], "y_cm": pose[1]}] + list(bypass_route_points)
+            self.active_bypass_route_points = list(bypass_route_points)
+            self.active_bypass_direction = bypass_direction
+            self.active_bypass_until = now + PLANNER_BYPASS_HOLD_SECONDS
+            self.active_bypass_goal_signature = current_goal_signature
             result.update(
                 {
                     "planner_status": self.last_status,
@@ -1500,6 +1556,10 @@ class JetsonRoutePlanner:
         self.last_path_world = [{"x_cm": point[0], "y_cm": point[1]} for point in path_world]
         route_points = self.simplify_world_path(path_world, goal)
         self.last_status = "tracking"
+        self.active_bypass_route_points = []
+        self.active_bypass_direction = None
+        self.active_bypass_until = 0.0
+        self.active_bypass_goal_signature = None
 
         result.update(
             {
