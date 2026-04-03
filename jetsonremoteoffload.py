@@ -80,12 +80,13 @@ ROSM_CAM_FLAG_OBS_LEFT_WALL_CLEAR = 0x40
 ROUTE_PACKET_LEN = 15
 ROUTE_PACKET_START = 0x30
 ROUTE_PACKET_END = 0x31
-FRONT_OBSTACLE_LIMIT_CM = 25
+FRONT_OBSTACLE_LIMIT_CM = 50
 SIDE_CLEAR_LIMIT_CM = 140
 FRONT_OBSTACLE_DEGREES = tuple(range(0, 19))
 LEFT_CLEAR_DEGREES = tuple(range(25, 81))
-RIGHT_CLEAR_DEGREES = tuple()
+RIGHT_CLEAR_DEGREES = tuple(range(280, 336))
 LEFT_WALL_TRACK_DEGREES = tuple(range(70, 111))
+RIGHT_WALL_TRACK_DEGREES = tuple(range(250, 291))
 LEFT_WALL_NEAR_CM = 30
 LEFT_WALL_CLEAR_CM = 55
 
@@ -591,7 +592,7 @@ def compute_obstacle_flags(scan):
 
     left_score = sum(left_distances) / len(left_distances) if left_distances else 0.0
     right_score = sum(right_distances) / len(right_distances) if right_distances else 0.0
-    if left_score >= right_score:
+    if left_score > (right_score + 15.0):
         flags |= ROSM_CAM_FLAG_OBS_PREFER_LEFT
 
     return flags
@@ -1031,13 +1032,15 @@ class JetsonRoutePlanner:
 
         left_distances = extract_valid_distances(lidar_scan or [], LEFT_CLEAR_DEGREES)
         right_distances = extract_valid_distances(lidar_scan or [], RIGHT_CLEAR_DEGREES)
+        right_wall_distances = extract_valid_distances(lidar_scan or [], RIGHT_WALL_TRACK_DEGREES)
         left_score = (sum(left_distances) / len(left_distances)) if left_distances else 0.0
         right_score = (sum(right_distances) / len(right_distances)) if right_distances else 0.0
+        right_wall_present = bool(right_wall_distances) and min(right_wall_distances) <= SIDE_CLEAR_LIMIT_CM
 
-        if left_score >= right_score:
-            direction_order = (("left", 1.0), ("right", -1.0))
-        else:
+        if right_wall_present or right_score >= left_score:
             direction_order = (("right", -1.0), ("left", 1.0))
+        else:
+            direction_order = (("left", 1.0), ("right", -1.0))
 
         goal_dx = float(goal["x_cm"]) - pose[0]
         goal_dy = float(goal["y_cm"]) - pose[1]
