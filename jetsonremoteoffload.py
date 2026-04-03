@@ -5,7 +5,7 @@ import math
 import os
 import threading
 import time
-from typing import Optional, Sequence, Tuple
+from typing import Optional
 
 import cv2
 import paho.mqtt.client as mqtt
@@ -39,15 +39,6 @@ LIDAR_SERIAL_BAUDRATE = 230400
 LIDAR_PACKET_LEN = 47
 LIDAR_POINTS_PER_PACKET = 12
 LIDAR_MAX_DISTANCE_CM = 700
-LIDAR_ODOM_ENABLED = True
-LIDAR_ODOM_FRONT_ONLY = True
-LIDAR_ODOM_SAMPLE_ANGLE_STEP_DEG = 3
-LIDAR_ODOM_MIN_POINTS_PER_SCAN = 40
-LIDAR_ODOM_MATCH_CELL_CM = 5.0
-LIDAR_ODOM_MAP_CELL_CM = 10.0
-LIDAR_ODOM_MAP_SIZE_CELLS = 260
-LIDAR_ODOM_MAX_OCCUPIED_POINTS = 1800
-LIDAR_ODOM_OCCUPIED_LOG_ODDS_THRESHOLD = 0.7
 
 CONTROL_MSG_LEN = 15
 CONTROL_MSG_START = 0x30
@@ -83,17 +74,22 @@ ROSM_CAM_FLAG_OBS_BLOCKED = 0x02
 ROSM_CAM_FLAG_OBS_LEFT_CLEAR = 0x04
 ROSM_CAM_FLAG_OBS_RIGHT_CLEAR = 0x08
 ROSM_CAM_FLAG_OBS_PREFER_LEFT = 0x10
+ROSM_CAM_FLAG_OBS_LEFT_NEAR_WALL = 0x20
+ROSM_CAM_FLAG_OBS_LEFT_WALL_CLEAR = 0x40
 
 ROUTE_PACKET_LEN = 15
 ROUTE_PACKET_START = 0x30
 ROUTE_PACKET_END = 0x31
-FRONT_OBSTACLE_LIMIT_CM = 120
+FRONT_OBSTACLE_LIMIT_CM = 25
 SIDE_CLEAR_LIMIT_CM = 140
-FRONT_OBSTACLE_DEGREES = tuple(range(0, 19)) + tuple(range(341, 360))
+FRONT_OBSTACLE_DEGREES = tuple(range(0, 19))
 LEFT_CLEAR_DEGREES = tuple(range(25, 81))
-RIGHT_CLEAR_DEGREES = tuple(range(280, 336))
+RIGHT_CLEAR_DEGREES = tuple()
+LEFT_WALL_TRACK_DEGREES = tuple(range(70, 111))
+LEFT_WALL_NEAR_CM = 30
+LEFT_WALL_CLEAR_CM = 55
 
-PLANNER_ENABLED = True
+PLANNER_ENABLED = False
 PLANNER_GRID_CELL_CM = 25.0
 PLANNER_GRID_SIZE = 57
 PLANNER_MAX_RANGE_CM = 700.0
@@ -552,24 +548,35 @@ def extract_valid_distances(scan, degree_indices):
             distance_cm = int(value)
         except (TypeError, ValueError):
             continue
-        if distance_cm <= 0:
+        if distance_cm <= 10:
             continue
         distances.append(distance_cm)
     return distances
+
+
+def lidar_degree_allowed_for_nav(degree: int) -> bool:
+    try:
+        degree = int(degree) % 360
+    except (TypeError, ValueError):
+        return False
+    return not (270 <= degree <= 359)
 
 
 def compute_obstacle_flags(scan):
     front_distances = extract_valid_distances(scan, FRONT_OBSTACLE_DEGREES)
     left_distances = extract_valid_distances(scan, LEFT_CLEAR_DEGREES)
     right_distances = extract_valid_distances(scan, RIGHT_CLEAR_DEGREES)
+    left_wall_distances = extract_valid_distances(scan, LEFT_WALL_TRACK_DEGREES)
 
-    if not front_distances and not left_distances and not right_distances:
+    if not front_distances and not left_distances and not right_distances and not left_wall_distances:
         return 0
 
     flags = ROSM_CAM_FLAG_OBS_VALID
     front_blocked = bool(front_distances) and min(front_distances) <= FRONT_OBSTACLE_LIMIT_CM
     left_clear = bool(left_distances) and min(left_distances) >= SIDE_CLEAR_LIMIT_CM
     right_clear = bool(right_distances) and min(right_distances) >= SIDE_CLEAR_LIMIT_CM
+    left_wall_near = bool(left_wall_distances) and min(left_wall_distances) <= LEFT_WALL_NEAR_CM
+    left_wall_clear = (not left_wall_distances) or (min(left_wall_distances) >= LEFT_WALL_CLEAR_CM)
 
     if front_blocked:
         flags |= ROSM_CAM_FLAG_OBS_BLOCKED
@@ -577,6 +584,10 @@ def compute_obstacle_flags(scan):
         flags |= ROSM_CAM_FLAG_OBS_LEFT_CLEAR
     if right_clear:
         flags |= ROSM_CAM_FLAG_OBS_RIGHT_CLEAR
+    if left_wall_near:
+        flags |= ROSM_CAM_FLAG_OBS_LEFT_NEAR_WALL
+    if left_wall_clear:
+        flags |= ROSM_CAM_FLAG_OBS_LEFT_WALL_CLEAR
 
     left_score = sum(left_distances) / len(left_distances) if left_distances else 0.0
     right_score = sum(right_distances) / len(right_distances) if right_distances else 0.0
@@ -593,303 +604,6 @@ def normalize_angle_deg(angle_deg: float) -> float:
     while angle <= -180.0:
         angle += 360.0
     return angle
-
-
-def rotate_point(point_xy: Tuple[float, float], angle_deg: float) -> Tuple[float, float]:
-    radians = math.radians(float(angle_deg))
-    cos_value = math.cos(radians)
-    sin_value = math.sin(radians)
-    x_value, y_value = point_xy
-    return (
-        (x_value * cos_value) - (y_value * sin_value),
-        (x_value * sin_value) + (y_value * cos_value),
-    )
-
-
-def local_to_world_vector(local_x_cm: float, local_y_cm: float, yaw_deg: float) -> Tuple[float, float]:
-    yaw_rad = math.radians(float(yaw_deg))
-    world_dx_cm = (math.cos(yaw_rad) * local_x_cm) - (math.sin(yaw_rad) * local_y_cm)
-    world_dy_cm = (math.sin(yaw_rad) * local_x_cm) + (math.cos(yaw_rad) * local_y_cm)
-    return world_dx_cm, world_dy_cm
-
-
-def lidar_snapshot_to_local_points(scan, max_range_cm: float, front_only: bool, angle_step_deg: int):
-    points = []
-    for degree, distance_cm in enumerate((scan or [])[:360]):
-        if distance_cm is None:
-            continue
-
-        if front_only and not (degree <= 90 or degree >= 270):
-            continue
-        if angle_step_deg > 1 and (degree % angle_step_deg) != 0:
-            continue
-
-        try:
-            distance = float(distance_cm)
-        except (TypeError, ValueError):
-            continue
-        if distance <= 0.0 or distance > max_range_cm:
-            continue
-
-        radians = math.radians(float(degree))
-        local_x_cm = -math.sin(radians) * distance
-        local_y_cm = math.cos(radians) * distance
-        points.append((local_x_cm, local_y_cm))
-    return points
-
-
-class LidarOdometryEstimator:
-    def __init__(self, match_cell_cm: float):
-        self.match_cell_cm = float(match_cell_cm)
-        self.prev_points = None
-        self.seeded = False
-        self.seeded_from_stm32 = False
-        self.pose_x_cm = 0.0
-        self.pose_y_cm = 0.0
-        self.pose_yaw_deg = 0.0
-
-    def seed_pose(self, x_cm: float, y_cm: float, yaw_deg: float, seeded_from_stm32: bool = False):
-        self.pose_x_cm = float(x_cm)
-        self.pose_y_cm = float(y_cm)
-        self.pose_yaw_deg = normalize_angle_deg(float(yaw_deg))
-        self.seeded = True
-        self.seeded_from_stm32 = bool(seeded_from_stm32)
-
-    def pose(self):
-        return (self.pose_x_cm, self.pose_y_cm, self.pose_yaw_deg)
-
-    def update(self, current_points):
-        if len(current_points) < LIDAR_ODOM_MIN_POINTS_PER_SCAN:
-            return (0.0, 0.0, 0.0, 0.0)
-
-        if self.prev_points is None or len(self.prev_points) < LIDAR_ODOM_MIN_POINTS_PER_SCAN:
-            self.prev_points = list(current_points)
-            return (0.0, 0.0, 0.0, 1.0)
-
-        point_grid = self._build_point_grid(self.prev_points)
-        best_dx, best_dy, best_dtheta_deg, best_score = self._search_best_transform(
-            point_grid,
-            current_points,
-            center_dx=0.0,
-            center_dy=0.0,
-            center_dtheta_deg=0.0,
-            dx_span_cm=25.0,
-            dy_span_cm=25.0,
-            dtheta_span_deg=12.0,
-            dx_step_cm=5.0,
-            dy_step_cm=5.0,
-            dtheta_step_deg=2.0,
-        )
-        best_dx, best_dy, best_dtheta_deg, best_score = self._search_best_transform(
-            point_grid,
-            current_points,
-            center_dx=best_dx,
-            center_dy=best_dy,
-            center_dtheta_deg=best_dtheta_deg,
-            dx_span_cm=8.0,
-            dy_span_cm=8.0,
-            dtheta_span_deg=4.0,
-            dx_step_cm=2.0,
-            dy_step_cm=2.0,
-            dtheta_step_deg=1.0,
-        )
-
-        world_dx_cm, world_dy_cm = local_to_world_vector(best_dx, best_dy, self.pose_yaw_deg)
-        self.pose_x_cm += world_dx_cm
-        self.pose_y_cm += world_dy_cm
-        self.pose_yaw_deg = normalize_angle_deg(self.pose_yaw_deg + best_dtheta_deg)
-        self.prev_points = list(current_points)
-
-        normalizer = float(max(1, min(len(current_points), len(self.prev_points))))
-        return (best_dx, best_dy, best_dtheta_deg, best_score / normalizer)
-
-    def _build_point_grid(self, points: Sequence[Tuple[float, float]]):
-        grid = set()
-        for x_cm, y_cm in points:
-            grid.add(
-                (
-                    int(round(x_cm / self.match_cell_cm)),
-                    int(round(y_cm / self.match_cell_cm)),
-                )
-            )
-        return grid
-
-    def _score_transform(self, point_grid, current_points, dx_cm: float, dy_cm: float, dtheta_deg: float):
-        score = 0
-        for point in current_points:
-            rotated_x_cm, rotated_y_cm = rotate_point(point, dtheta_deg)
-            transformed = (
-                int(round((rotated_x_cm + dx_cm) / self.match_cell_cm)),
-                int(round((rotated_y_cm + dy_cm) / self.match_cell_cm)),
-            )
-            if transformed in point_grid:
-                score += 1
-        return score
-
-    def _search_best_transform(
-        self,
-        point_grid,
-        current_points,
-        center_dx: float,
-        center_dy: float,
-        center_dtheta_deg: float,
-        dx_span_cm: float,
-        dy_span_cm: float,
-        dtheta_span_deg: float,
-        dx_step_cm: float,
-        dy_step_cm: float,
-        dtheta_step_deg: float,
-    ):
-        best_dx = center_dx
-        best_dy = center_dy
-        best_dtheta_deg = center_dtheta_deg
-        best_score = -1
-
-        dx_value = center_dx - dx_span_cm
-        while dx_value <= (center_dx + dx_span_cm + 1e-9):
-            dy_value = center_dy - dy_span_cm
-            while dy_value <= (center_dy + dy_span_cm + 1e-9):
-                dtheta_value = center_dtheta_deg - dtheta_span_deg
-                while dtheta_value <= (center_dtheta_deg + dtheta_span_deg + 1e-9):
-                    score = self._score_transform(point_grid, current_points, dx_value, dy_value, dtheta_value)
-                    if score > best_score:
-                        best_dx = dx_value
-                        best_dy = dy_value
-                        best_dtheta_deg = dtheta_value
-                        best_score = score
-                    dtheta_value += dtheta_step_deg
-                dy_value += dy_step_cm
-            dx_value += dx_step_cm
-
-        return (best_dx, best_dy, best_dtheta_deg, best_score)
-
-
-class PersistentOccupancyMap:
-    def __init__(self, size_cells: int, cell_cm: float):
-        self.size_cells = int(size_cells)
-        self.cell_cm = float(cell_cm)
-        self.log_odds = [0.0] * (self.size_cells * self.size_cells)
-        self.origin_x_cm = -(self.size_cells * self.cell_cm * 0.5)
-        self.origin_y_cm = -(self.size_cells * self.cell_cm * 0.5)
-        self.seeded = False
-        self.hit_log_odds = 0.9
-        self.free_log_odds = -0.2
-        self.max_log_odds = 3.5
-        self.min_log_odds = -3.5
-
-    def seed_origin_from_pose(self, x_cm: float, y_cm: float):
-        if self.seeded:
-            return
-        half_span_cm = (self.size_cells * self.cell_cm) * 0.5
-        self.origin_x_cm = float(x_cm) - half_span_cm
-        self.origin_y_cm = float(y_cm) - half_span_cm
-        self.seeded = True
-
-    def world_to_cell(self, x_cm: float, y_cm: float):
-        cell_x = int(math.floor((float(x_cm) - self.origin_x_cm) / self.cell_cm))
-        cell_y = int(math.floor((float(y_cm) - self.origin_y_cm) / self.cell_cm))
-        if 0 <= cell_x < self.size_cells and 0 <= cell_y < self.size_cells:
-            return (cell_x, cell_y)
-        return None
-
-    def cell_to_world(self, cell):
-        return (
-            self.origin_x_cm + ((cell[0] + 0.5) * self.cell_cm),
-            self.origin_y_cm + ((cell[1] + 0.5) * self.cell_cm),
-        )
-
-    def update_from_scan(self, pose, local_points):
-        robot_cell = self.world_to_cell(pose[0], pose[1])
-        if robot_cell is None:
-            return
-
-        for local_x_cm, local_y_cm in local_points:
-            world_dx_cm, world_dy_cm = local_to_world_vector(local_x_cm, local_y_cm, pose[2])
-            end_cell = self.world_to_cell(pose[0] + world_dx_cm, pose[1] + world_dy_cm)
-            if end_cell is None:
-                continue
-
-            ray_cells = self._bresenham(robot_cell[0], robot_cell[1], end_cell[0], end_cell[1])
-            if len(ray_cells) <= 1:
-                continue
-
-            for free_cell in ray_cells[:-1]:
-                self._add_log_odds(free_cell[0], free_cell[1], self.free_log_odds)
-            self._add_log_odds(end_cell[0], end_cell[1], self.hit_log_odds)
-
-    def export_occupied_world_points(self, max_points: int, threshold: float):
-        occupied = []
-        for y_idx in range(self.size_cells):
-            row_offset = y_idx * self.size_cells
-            for x_idx in range(self.size_cells):
-                if self.log_odds[row_offset + x_idx] >= threshold:
-                    world_x_cm, world_y_cm = self.cell_to_world((x_idx, y_idx))
-                    occupied.append({"x_cm": round(world_x_cm, 1), "y_cm": round(world_y_cm, 1)})
-
-        if len(occupied) <= max_points:
-            return occupied
-
-        stride = max(1, int(math.ceil(len(occupied) / float(max_points))))
-        reduced = occupied[::stride]
-        if len(reduced) > max_points:
-            reduced = reduced[:max_points]
-        return reduced
-
-    def export_occupied_cells(self, max_points: int, threshold: float):
-        occupied = []
-        for y_idx in range(self.size_cells):
-            row_offset = y_idx * self.size_cells
-            for x_idx in range(self.size_cells):
-                log_odds = self.log_odds[row_offset + x_idx]
-                if log_odds >= threshold:
-                    occupied.append(
-                        {
-                            "x": int(x_idx),
-                            "y": int(y_idx),
-                            "log_odds": round(float(log_odds), 3),
-                        }
-                    )
-
-        if len(occupied) <= max_points:
-            return occupied
-
-        stride = max(1, int(math.ceil(len(occupied) / float(max_points))))
-        reduced = occupied[::stride]
-        if len(reduced) > max_points:
-            reduced = reduced[:max_points]
-        return reduced
-
-    def _add_log_odds(self, x_idx: int, y_idx: int, delta: float):
-        index = (y_idx * self.size_cells) + x_idx
-        next_value = self.log_odds[index] + delta
-        if next_value > self.max_log_odds:
-            next_value = self.max_log_odds
-        elif next_value < self.min_log_odds:
-            next_value = self.min_log_odds
-        self.log_odds[index] = next_value
-
-    def _bresenham(self, x0: int, y0: int, x1: int, y1: int):
-        cells = []
-        dx = abs(x1 - x0)
-        dy = -abs(y1 - y0)
-        step_x = 1 if x0 < x1 else -1
-        step_y = 1 if y0 < y1 else -1
-        error = dx + dy
-        x_value = x0
-        y_value = y0
-
-        while True:
-            cells.append((x_value, y_value))
-            if x_value == x1 and y_value == y1:
-                break
-            error_twice = 2 * error
-            if error_twice >= dy:
-                error += dy
-                x_value += step_x
-            if error_twice <= dx:
-                error += dx
-                y_value += step_y
-        return cells
 
 
 def world_distance_cm(a, b) -> float:
@@ -1174,6 +888,8 @@ class JetsonRoutePlanner:
         inflation_cells = max(1, int(math.ceil(PLANNER_OBSTACLE_INFLATION_CM / PLANNER_GRID_CELL_CM)))
 
         for degree, distance_cm in enumerate((lidar_scan or [])[:360]):
+            if not lidar_degree_allowed_for_nav(degree):
+                continue
             if distance_cm is None:
                 continue
             try:
@@ -1286,6 +1002,8 @@ class JetsonRoutePlanner:
         check_distance_cm = min(goal_distance_cm, PLANNER_BYPASS_LOOKAHEAD_CM)
 
         for degree, distance_cm in enumerate((lidar_scan or [])[:360]):
+            if not lidar_degree_allowed_for_nav(degree):
+                continue
             if distance_cm is None:
                 continue
             try:
@@ -1367,6 +1085,17 @@ class JetsonRoutePlanner:
             )
         packets.append(build_route_packet(ROSM_CMD_ROUTE_COMMIT))
         return packets
+
+    def build_remaining_mission_route(self):
+        route_points = []
+        for waypoint in self.mission_waypoints[self.active_goal_index : self.active_goal_index + PLANNER_MAX_ROUTE_POINTS]:
+            route_points.append(
+                {
+                    "x_cm": float(waypoint["x_cm"]),
+                    "y_cm": float(waypoint["y_cm"]),
+                }
+            )
+        return route_points
 
     def update(self, control_state: dict, telemetry: dict, lidar_scan, now: float):
         self.update_command_state(control_state)
@@ -1495,7 +1224,7 @@ class JetsonRoutePlanner:
 
         path_world = [self.cell_to_world(origin_x_cm, origin_y_cm, cell) for cell in path_cells]
         self.last_path_world = [{"x_cm": point[0], "y_cm": point[1]} for point in path_world]
-        route_points = self.simplify_world_path(path_world, goal)
+        route_points = self.build_remaining_mission_route()
         self.last_status = "tracking"
 
         result.update(
@@ -1767,9 +1496,6 @@ def main():
     last_headless_status_print_time = 0.0
     last_route_update_id = -1
     lidar_reader = LidarReader()
-    lidar_odom = LidarOdometryEstimator(LIDAR_ODOM_MATCH_CELL_CM)
-    occupancy_map = PersistentOccupancyMap(LIDAR_ODOM_MAP_SIZE_CELLS, LIDAR_ODOM_MAP_CELL_CM)
-    last_lidar_scan_timestamp = 0.0
     planner = JetsonRoutePlanner()
     latest_telemetry = {
         "robot_state": STATE_MANUAL,
@@ -1780,34 +1506,13 @@ def main():
         "route_size": 0,
         "sound": {"valid": False, "drone_detected": False, "distance_cm": None, "bearing_deg": None},
         "lidar_scan": [None] * 360,
+        "lidar_scan_timestamp": 0.0,
         "planner_enabled": bool(PLANNER_ENABLED),
         "planner_goal": None,
         "planner_path": [],
         "planner_status": "idle",
         "planner_path_age_s": 0.0,
         "planner_obstacle_count": 0,
-        "mapping": {
-            "enabled": bool(LIDAR_ODOM_ENABLED),
-            "status": "idle",
-            "pose_x_cm": 0.0,
-            "pose_y_cm": 0.0,
-            "pose_yaw_deg": 0.0,
-            "seeded": False,
-            "seeded_from_stm32": False,
-            "match_score": 0.0,
-            "delta_x_cm": 0.0,
-            "delta_y_cm": 0.0,
-            "delta_yaw_deg": 0.0,
-            "cell_cm": float(LIDAR_ODOM_MAP_CELL_CM),
-            "origin_x_cm": 0.0,
-            "origin_y_cm": 0.0,
-            "size_cells": int(LIDAR_ODOM_MAP_SIZE_CELLS),
-            "occupied_cells": [],
-            "occupied_points_world": [],
-            "occupied_count": 0,
-            "front_only": bool(LIDAR_ODOM_FRONT_ONLY),
-            "timestamp": 0.0,
-        },
     }
 
     def on_connect(client, userdata, flags, reason_code, properties):
@@ -1910,72 +1615,6 @@ def main():
             active_target = choose_active_target(target_records, selected_target_id)
             lidar_scan_snapshot, lidar_scan_timestamp = lidar_reader.get_scan_snapshot_with_timestamp()
             obstacle_flags = compute_obstacle_flags(lidar_scan_snapshot)
-            if LIDAR_ODOM_ENABLED and lidar_scan_timestamp > last_lidar_scan_timestamp:
-                local_points = lidar_snapshot_to_local_points(
-                    lidar_scan_snapshot,
-                    float(LIDAR_MAX_DISTANCE_CM),
-                    bool(LIDAR_ODOM_FRONT_ONLY),
-                    int(LIDAR_ODOM_SAMPLE_ANGLE_STEP_DEG),
-                )
-                mapping_payload = dict(latest_telemetry.get("mapping", {}))
-                if (not lidar_odom.seeded) and ("timestamp" in latest_telemetry):
-                    lidar_odom.seed_pose(
-                        latest_telemetry.get("x_cm", 0.0),
-                        latest_telemetry.get("y_cm", 0.0),
-                        latest_telemetry.get("yaw_deg", 0.0),
-                        seeded_from_stm32=True,
-                    )
-                    occupancy_map.seed_origin_from_pose(lidar_odom.pose_x_cm, lidar_odom.pose_y_cm)
-
-                if len(local_points) >= LIDAR_ODOM_MIN_POINTS_PER_SCAN:
-                    if not lidar_odom.seeded:
-                        lidar_odom.seed_pose(0.0, 0.0, 0.0, seeded_from_stm32=False)
-                        occupancy_map.seed_origin_from_pose(0.0, 0.0)
-                    delta_x_cm, delta_y_cm, delta_yaw_deg, match_score = lidar_odom.update(local_points)
-                    occupancy_map.update_from_scan(lidar_odom.pose(), local_points)
-                    mapping_payload.update(
-                        {
-                            "enabled": True,
-                            "status": "tracking",
-                            "pose_x_cm": round(lidar_odom.pose_x_cm, 1),
-                            "pose_y_cm": round(lidar_odom.pose_y_cm, 1),
-                            "pose_yaw_deg": round(lidar_odom.pose_yaw_deg, 1),
-                            "seeded": bool(lidar_odom.seeded),
-                            "seeded_from_stm32": bool(lidar_odom.seeded_from_stm32),
-                            "match_score": round(match_score, 3),
-                            "delta_x_cm": round(delta_x_cm, 1),
-                            "delta_y_cm": round(delta_y_cm, 1),
-                            "delta_yaw_deg": round(delta_yaw_deg, 1),
-                            "cell_cm": float(LIDAR_ODOM_MAP_CELL_CM),
-                            "origin_x_cm": round(float(occupancy_map.origin_x_cm), 1),
-                            "origin_y_cm": round(float(occupancy_map.origin_y_cm), 1),
-                            "size_cells": int(occupancy_map.size_cells),
-                            "occupied_cells": occupancy_map.export_occupied_cells(
-                                LIDAR_ODOM_MAX_OCCUPIED_POINTS,
-                                LIDAR_ODOM_OCCUPIED_LOG_ODDS_THRESHOLD,
-                            ),
-                            "occupied_points_world": occupancy_map.export_occupied_world_points(
-                                LIDAR_ODOM_MAX_OCCUPIED_POINTS,
-                                LIDAR_ODOM_OCCUPIED_LOG_ODDS_THRESHOLD,
-                            ),
-                            "front_only": bool(LIDAR_ODOM_FRONT_ONLY),
-                            "timestamp": now,
-                        }
-                    )
-                    mapping_payload["occupied_count"] = len(mapping_payload.get("occupied_points_world", []))
-                else:
-                    mapping_payload.update(
-                        {
-                            "enabled": True,
-                            "status": "waiting_scan",
-                            "seeded": bool(lidar_odom.seeded),
-                            "seeded_from_stm32": bool(lidar_odom.seeded_from_stm32),
-                            "timestamp": now,
-                        }
-                    )
-
-                latest_telemetry["mapping"] = mapping_payload
-                last_lidar_scan_timestamp = lidar_scan_timestamp
             planner_update = planner.update(active_control, latest_telemetry, lidar_scan_snapshot, now)
             latest_telemetry.update(
                 {
@@ -1985,6 +1624,7 @@ def main():
                     "planner_status": planner_update.get("planner_status", "idle"),
                     "planner_path_age_s": planner_update.get("planner_path_age_s", 0.0),
                     "planner_obstacle_count": planner_update.get("planner_obstacle_count", 0),
+                    "lidar_scan_timestamp": float(lidar_scan_timestamp),
                 }
             )
 
@@ -2093,13 +1733,13 @@ def main():
                             "selected_target_id": selected_target_id,
                             "active_target_id": active_target["id"] if active_target is not None else None,
                             "lidar_scan": lidar_scan_snapshot,
+                            "lidar_scan_timestamp": float(lidar_scan_timestamp),
                             "planner_enabled": planner_update.get("planner_enabled", bool(PLANNER_ENABLED)),
                             "planner_goal": planner_update.get("planner_goal"),
                             "planner_path": planner_update.get("planner_path", []),
                             "planner_status": planner_update.get("planner_status", "idle"),
                             "planner_path_age_s": planner_update.get("planner_path_age_s", 0.0),
                             "planner_obstacle_count": planner_update.get("planner_obstacle_count", 0),
-                            "mapping": dict(latest_telemetry.get("mapping", {})),
                         }
                     )
                     mqtt_client.publish(MQTT_TOPIC_TELEMETRY, json.dumps(telemetry_snapshot))
