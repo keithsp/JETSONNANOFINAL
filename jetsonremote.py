@@ -186,6 +186,7 @@ class CommandState:
     def clear_route_action(self):
         with self._lock:
             self._state["route_action"] = "none"
+            self._state["waypoints"] = []
 
 
 class LidarReader:
