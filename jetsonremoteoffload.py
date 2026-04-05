@@ -33,6 +33,7 @@ CAMERA_JPEG_QUALITY = 70
 AUX_CAMERA_RETRY_SECONDS = 2.0
 TELEMETRY_PUBLISH_INTERVAL_SECONDS = 0.2
 HEADLESS_STATUS_PRINT_INTERVAL_SECONDS = 5.0
+SERIAL_RECONNECT_INTERVAL_SECONDS = 1.0
 
 LIDAR_SERIAL_PORT = "/dev/ttyUSB0"
 LIDAR_SERIAL_BAUDRATE = 230400
@@ -48,7 +49,7 @@ CONTROL_MSG_END = 0x31
 JETSON_STATUS_STX = 0xAA
 JETSON_STATUS_PKT_SIZE = 23
 JETSON_STATUS_EXT_STX = 0xAB
-JETSON_STATUS_EXT_PKT_SIZE = 17
+JETSON_STATUS_EXT_PKT_SIZE = 21
 
 ROSM_MOVE_FORWARD = 0x01
 ROSM_MOVE_BACKWARD = 0x02
@@ -69,6 +70,11 @@ ROSM_CMD_CAM_OBJ = 0x01
 ROSM_CMD_ROUTE_CLEAR = 0x21
 ROSM_CMD_ROUTE_APPEND = 0x22
 ROSM_CMD_ROUTE_COMMIT = 0x23
+ROSM_CMD_GOAL_SET = 0x24
+ROSM_CMD_GOAL_CTRL = 0x25
+ROSM_GOAL_CTRL_CANCEL = 0x01
+ROSM_GOAL_CTRL_PAUSE = 0x02
+ROSM_GOAL_CTRL_RESUME = 0x03
 ROSM_CAM_FLAG_OBS_VALID = 0x01
 ROSM_CAM_FLAG_OBS_BLOCKED = 0x02
 ROSM_CAM_FLAG_OBS_LEFT_CLEAR = 0x04
@@ -109,6 +115,15 @@ PLANNER_BYPASS_LATERAL_CM = 130.0
 PLANNER_BYPASS_CLEARANCE_CM = 85.0
 PLANNER_BYPASS_PATH_ANGLE_DEG = 24.0
 PLANNER_BYPASS_HOLD_SECONDS = 1.6
+PLANNER_ROUTE_CONTROL_ENABLED = False
+
+ROUTE_PACKET_META_MAGIC = 0xA5
+ROUTE_PACKET_META_VERSION = 0x01
+GOAL_PACKET_META_MAGIC = 0x5A
+GOAL_PACKET_META_VERSION = 0x01
+GOAL_DEFAULT_TOLERANCE_CM = 40
+GOAL_COMMAND_RETRY_INTERVAL_SECONDS = 0.25
+STM32_TELEMETRY_STALE_SECONDS = 0.75
 
 STATE_MANUAL = "MANUAL"
 STATE_AUTO_PATROLLING = "AUTO_PATROLLING"
@@ -117,6 +132,15 @@ STATE_ENUM_MAP = {
     0x0: STATE_MANUAL,
     0x1: STATE_AUTO_PATROLLING,
     0x2: STATE_AUTO_TARGETING,
+}
+
+GOAL_STATE_MAP = {
+    0x0: "idle",
+    0x1: "active",
+    0x2: "paused",
+    0x3: "reached",
+    0x4: "cancelled",
+    0x5: "failed",
 }
 
 MQTT_COMMAND_ALIASES = {
@@ -165,15 +189,35 @@ class CommandState:
             "selected_target_id": None,
             "route_action": "none",
             "waypoints": [],
+            "route_revision": 0,
             "route_update_id": 0,
         }
 
     def set(self, value: dict):
         with self._lock:
             route_update_id = self._state.get("route_update_id", 0)
-            if value.get("route_action", "none") != "none":
-                route_update_id += 1
-            next_state = dict(value)
+            route_action = str(value.get("route_action", "none")).strip().lower()
+            incoming_waypoints = value.get("waypoints", [])
+            incoming_route_revision = value.get("route_revision", self._state.get("route_revision", 0))
+            incoming_route_update_id = value.get("route_update_id", route_update_id)
+            if route_action != "none":
+                try:
+                    route_update_id = int(incoming_route_update_id)
+                except (TypeError, ValueError):
+                    route_update_id += 1
+            next_state = dict(self._state)
+            next_state.update(value)
+            next_state["route_action"] = route_action
+            if route_action != "none":
+                next_state["waypoints"] = [dict(waypoint) for waypoint in incoming_waypoints]
+            elif incoming_waypoints:
+                next_state["waypoints"] = [dict(waypoint) for waypoint in incoming_waypoints]
+            else:
+                next_state["waypoints"] = [dict(waypoint) for waypoint in self._state.get("waypoints", [])]
+            try:
+                next_state["route_revision"] = int(incoming_route_revision)
+            except (TypeError, ValueError):
+                next_state["route_revision"] = int(self._state.get("route_revision", 0))
             next_state["route_update_id"] = route_update_id
             self._state = next_state
 
@@ -184,7 +228,13 @@ class CommandState:
     def clear_route_action(self):
         with self._lock:
             self._state["route_action"] = "none"
-            self._state["waypoints"] = []
+
+
+def build_route_packet_checksum(payload: bytes) -> int:
+    checksum = ROUTE_PACKET_META_MAGIC ^ ROUTE_PACKET_META_VERSION
+    for value in payload:
+        checksum ^= int(value) & 0xFF
+    return checksum & 0xFF
 
 
 class LidarReader:
@@ -378,6 +428,14 @@ def parse_command_payload(data: dict) -> str:
     turret_bits = int(data.get("turret_bits", 0)) & 0xFF
     aux_bits = int(data.get("aux_bits", 0)) & 0xFF
     route_action = str(data.get("route_action", "none")).strip() or "none"
+    try:
+        route_revision = int(data.get("route_revision", 0))
+    except (TypeError, ValueError):
+        route_revision = 0
+    try:
+        route_update_id = int(data.get("route_update_id", 0))
+    except (TypeError, ValueError):
+        route_update_id = 0
     raw_waypoints = data.get("waypoints", [])
     waypoints = []
     selected_target_id = data.get("selected_target_id")
@@ -437,6 +495,8 @@ def parse_command_payload(data: dict) -> str:
             "selected_target_id": selected_target_id,
             "route_action": route_action,
             "waypoints": waypoints,
+            "route_revision": route_revision,
+            "route_update_id": route_update_id,
         }
 
     text_command = str(data.get("command", "")).strip()
@@ -469,6 +529,8 @@ def parse_command_payload(data: dict) -> str:
 
     state["route_action"] = route_action
     state["waypoints"] = waypoints
+    state["route_revision"] = route_revision
+    state["route_update_id"] = route_update_id
     return state
 
 
@@ -510,6 +572,56 @@ def build_route_packet(command: int, index: int = 0, x_cm: int = 0, y_cm: int = 
     msg[4] = (x_cm >> 8) & 0xFF
     msg[5] = y_cm & 0xFF
     msg[6] = (y_cm >> 8) & 0xFF
+    msg[7] = ROUTE_PACKET_META_MAGIC
+    msg[8] = ROUTE_PACKET_META_VERSION
+    msg[9] = build_route_packet_checksum(msg[1:7])
+    msg[14] = ROUTE_PACKET_END
+    return bytes(msg)
+
+
+def build_goal_packet_checksum(payload: bytes) -> int:
+    checksum = GOAL_PACKET_META_MAGIC ^ GOAL_PACKET_META_VERSION
+    for value in payload:
+        checksum ^= int(value) & 0xFF
+    return checksum & 0xFF
+
+
+def build_goal_set_packet(route_revision: int, goal_seq: int, x_cm: int, y_cm: int, tolerance_cm: int = GOAL_DEFAULT_TOLERANCE_CM) -> bytes:
+    x_cm = max(-32768, min(32767, int(x_cm)))
+    y_cm = max(-32768, min(32767, int(y_cm)))
+    tolerance_cm = max(1, min(255, int(tolerance_cm)))
+
+    msg = bytearray(ROUTE_PACKET_LEN)
+    msg[0] = ROUTE_PACKET_START
+    msg[1] = ROSM_CMD_GOAL_SET
+    msg[2] = int(goal_seq) & 0xFF
+    msg[3] = x_cm & 0xFF
+    msg[4] = (x_cm >> 8) & 0xFF
+    msg[5] = y_cm & 0xFF
+    msg[6] = (y_cm >> 8) & 0xFF
+    msg[7] = int(route_revision) & 0xFF
+    msg[8] = 0
+    msg[9] = tolerance_cm & 0xFF
+    msg[10] = GOAL_PACKET_META_MAGIC
+    msg[11] = GOAL_PACKET_META_VERSION
+    msg[12] = build_goal_packet_checksum(msg[1:10])
+    msg[13] = 0
+    msg[14] = ROUTE_PACKET_END
+    return bytes(msg)
+
+
+def build_goal_control_packet(route_revision: int, goal_seq: int, control_code: int) -> bytes:
+    msg = bytearray(ROUTE_PACKET_LEN)
+    msg[0] = ROUTE_PACKET_START
+    msg[1] = ROSM_CMD_GOAL_CTRL
+    msg[2] = int(goal_seq) & 0xFF
+    msg[7] = int(route_revision) & 0xFF
+    msg[8] = int(control_code) & 0xFF
+    msg[9] = 0
+    msg[10] = GOAL_PACKET_META_MAGIC
+    msg[11] = GOAL_PACKET_META_VERSION
+    msg[12] = build_goal_packet_checksum(msg[1:10])
+    msg[13] = 0
     msg[14] = ROUTE_PACKET_END
     return bytes(msg)
 
@@ -625,6 +737,298 @@ def waypoint_signature(waypoints) -> tuple:
         label = str(waypoint.get("label", "")).strip()[:16]
         signature.append((label, x_cm, y_cm))
     return tuple(signature)
+
+
+def normalize_waypoints(waypoints):
+    normalized = []
+    for index, waypoint in enumerate(waypoints or []):
+        if not isinstance(waypoint, dict):
+            continue
+        try:
+            x_cm = int(round(float(waypoint.get("x_cm", 0.0))))
+            y_cm = int(round(float(waypoint.get("y_cm", 0.0))))
+        except (TypeError, ValueError):
+            continue
+        label = str(waypoint.get("label", f"WP{index + 1}")).strip() or f"WP{index + 1}"
+        normalized.append({"label": label[:16], "x_cm": x_cm, "y_cm": y_cm})
+    return normalized
+
+
+class MissionQueueController:
+    def __init__(self):
+        self.route_revision = 0
+        self.last_route_update_id = -1
+        self.mission_waypoints = []
+        self.active_goal_index = 0
+        self.paused = False
+        self.cancel_requested = False
+        self.cancel_goal_revision = 0
+        self.cancel_goal_seq = 0
+        self.cancel_has_target = False
+        self.status = "idle"
+        self.last_command_time = 0.0
+        self.last_goal_event_counter = None
+        self.stm_goal_route_revision = 0
+        self.stm_goal_seq = 0
+        self.stm_goal_state = "idle"
+        self.stm_goal_event_counter = 0
+        self.stm_goal_loaded = False
+        self.stm_goal_paused = False
+        self.stm_timestamp = 0.0
+
+    def _current_goal(self):
+        if 0 <= self.active_goal_index < len(self.mission_waypoints):
+            waypoint = dict(self.mission_waypoints[self.active_goal_index])
+            waypoint["index"] = int(self.active_goal_index)
+            waypoint["route_revision"] = int(self.route_revision)
+            return waypoint
+        return None
+
+    def _remaining_path(self, telemetry: dict):
+        path = []
+        goal = self._current_goal()
+        if goal is None:
+            return path
+        try:
+            pose_x = float(telemetry.get("x_cm", 0.0))
+            pose_y = float(telemetry.get("y_cm", 0.0))
+            path.append({"x_cm": pose_x, "y_cm": pose_y})
+        except (TypeError, ValueError):
+            pass
+        for waypoint in self.mission_waypoints[self.active_goal_index :]:
+            path.append({"x_cm": float(waypoint["x_cm"]), "y_cm": float(waypoint["y_cm"])})
+        return path
+
+    def _goal_matches_stm32(self, route_revision: int, goal_seq: int) -> bool:
+        return (self.stm_goal_route_revision == (int(route_revision) & 0xFF)) and (self.stm_goal_seq == (int(goal_seq) & 0xFF))
+
+    def _apply_route_action(self, control_state: dict) -> bool:
+        route_action = str(control_state.get("route_action", "none")).strip().lower()
+        try:
+            route_update_id = int(control_state.get("route_update_id", -1))
+        except (TypeError, ValueError):
+            route_update_id = -1
+
+        if route_action == "none" or route_update_id == self.last_route_update_id:
+            return False
+
+        self.last_route_update_id = route_update_id
+        waypoints = normalize_waypoints(control_state.get("waypoints", []))
+
+        if route_action == "replace_queue":
+            current_goal = self._current_goal()
+            try:
+                next_revision = int(control_state.get("route_revision", ((self.route_revision + 1) & 0xFF) or 1)) & 0xFF
+            except (TypeError, ValueError):
+                next_revision = ((self.route_revision + 1) & 0xFF) or 1
+            self.route_revision = next_revision or 1
+            self.mission_waypoints = waypoints
+            self.active_goal_index = 0
+            self.paused = False
+            self.cancel_requested = not bool(self.mission_waypoints)
+            if current_goal is not None:
+                self.cancel_goal_revision = int(current_goal["route_revision"]) & 0xFF
+                self.cancel_goal_seq = int(current_goal["index"]) & 0xFF
+                self.cancel_has_target = True
+            elif self.mission_waypoints:
+                self.cancel_has_target = False
+            self.status = "goal_dispatch" if self.mission_waypoints else "cancel_pending"
+            self.last_command_time = 0.0
+            return True
+
+        if route_action == "cancel_queue":
+            current_goal = self._current_goal()
+            if current_goal is not None:
+                self.cancel_goal_revision = int(current_goal["route_revision"]) & 0xFF
+                self.cancel_goal_seq = int(current_goal["index"]) & 0xFF
+                self.cancel_has_target = True
+            self.mission_waypoints = []
+            self.active_goal_index = 0
+            self.paused = False
+            self.cancel_requested = True
+            self.status = "cancel_pending"
+            self.last_command_time = 0.0
+            return True
+
+        if route_action == "pause_queue":
+            self.paused = True
+            self.status = "pause_pending" if self._current_goal() is not None else "paused"
+            self.last_command_time = 0.0
+            return True
+
+        if route_action == "resume_queue":
+            self.paused = False
+            self.status = "goal_dispatch" if self._current_goal() is not None else "idle"
+            self.last_command_time = 0.0
+            return True
+
+        return False
+
+    def _capture_stm32_state(self, telemetry: dict):
+        try:
+            self.stm_goal_route_revision = int(telemetry.get("goal_route_revision", self.stm_goal_route_revision)) & 0xFF
+        except (TypeError, ValueError):
+            pass
+        try:
+            self.stm_goal_seq = int(telemetry.get("goal_seq", self.stm_goal_seq)) & 0xFF
+        except (TypeError, ValueError):
+            pass
+        self.stm_goal_state = str(telemetry.get("goal_state", self.stm_goal_state or "idle")).strip().lower() or "idle"
+        try:
+            self.stm_goal_event_counter = int(telemetry.get("goal_event_counter", self.stm_goal_event_counter)) & 0xFF
+        except (TypeError, ValueError):
+            pass
+        self.stm_goal_loaded = bool(telemetry.get("goal_loaded", self.stm_goal_loaded))
+        self.stm_goal_paused = bool(telemetry.get("goal_paused", self.stm_goal_paused))
+        try:
+            self.stm_timestamp = float(telemetry.get("timestamp", self.stm_timestamp))
+        except (TypeError, ValueError):
+            pass
+
+    def _handle_goal_event(self):
+        if self.last_goal_event_counter is None:
+            self.last_goal_event_counter = self.stm_goal_event_counter
+            return
+
+        if self.stm_goal_event_counter == self.last_goal_event_counter:
+            return
+
+        self.last_goal_event_counter = self.stm_goal_event_counter
+        current_goal = self._current_goal()
+        if current_goal is not None and self._goal_matches_stm32(self.route_revision, current_goal["index"]):
+            if self.stm_goal_state == "reached":
+                self.active_goal_index += 1
+                self.last_command_time = 0.0
+                if self._current_goal() is None:
+                    self.status = "complete"
+                elif self.paused:
+                    self.status = "paused"
+                else:
+                    self.status = "goal_dispatch"
+                return
+            if self.stm_goal_state == "active":
+                self.status = "enroute"
+                return
+            if self.stm_goal_state == "paused":
+                self.status = "paused"
+                return
+            if self.stm_goal_state == "failed":
+                self.status = "goal_failed"
+                return
+
+        if self.stm_goal_state == "cancelled":
+            if self.cancel_requested:
+                self.cancel_requested = False
+                self.status = "cancelled"
+            elif self._current_goal() is not None and not self.paused:
+                self.status = "goal_dispatch"
+                self.last_command_time = 0.0
+
+    def _dispatch_packets(self, telemetry: dict, now: float):
+        packets = []
+        current_goal = self._current_goal()
+        telemetry_stale = (self.stm_timestamp <= 0.0) or ((now - self.stm_timestamp) > STM32_TELEMETRY_STALE_SECONDS)
+
+        if self.cancel_requested:
+            if self.stm_timestamp > 0.0 and self.stm_goal_state in {"idle", "cancelled"} and not self.stm_goal_loaded:
+                self.cancel_requested = False
+                self.cancel_has_target = False
+                self.status = "cancelled" if not self.mission_waypoints else self.status
+                return packets
+            cancel_route_revision = self.stm_goal_route_revision
+            cancel_goal_seq = self.stm_goal_seq
+            if (self.stm_timestamp <= 0.0 or self.stm_goal_state in {"idle", "cancelled"}) and self.cancel_has_target:
+                cancel_route_revision = self.cancel_goal_revision
+                cancel_goal_seq = self.cancel_goal_seq
+            if (now - self.last_command_time) >= GOAL_COMMAND_RETRY_INTERVAL_SECONDS:
+                packets.append(
+                    build_goal_control_packet(
+                        cancel_route_revision,
+                        cancel_goal_seq,
+                        ROSM_GOAL_CTRL_CANCEL,
+                    )
+                )
+                self.last_command_time = now
+                self.status = "cancel_pending"
+            return packets
+
+        if current_goal is None:
+            if self.status == "complete":
+                return packets
+            if not self.mission_waypoints:
+                self.status = "idle"
+            return packets
+
+        expected_revision = int(self.route_revision) & 0xFF
+        expected_goal_seq = int(current_goal["index"]) & 0xFF
+        goal_matches = self._goal_matches_stm32(expected_revision, expected_goal_seq)
+
+        if self.paused:
+            if goal_matches and self.stm_goal_state == "paused":
+                self.status = "paused"
+                return packets
+            if goal_matches and self.stm_goal_state == "active" and (now - self.last_command_time) >= GOAL_COMMAND_RETRY_INTERVAL_SECONDS:
+                packets.append(build_goal_control_packet(expected_revision, expected_goal_seq, ROSM_GOAL_CTRL_PAUSE))
+                self.last_command_time = now
+                self.status = "pause_pending"
+            elif not goal_matches:
+                self.status = "paused"
+            return packets
+
+        if goal_matches and self.stm_goal_state == "active" and not telemetry_stale:
+            self.status = "enroute"
+            return packets
+
+        if goal_matches and self.stm_goal_state == "paused" and (now - self.last_command_time) >= GOAL_COMMAND_RETRY_INTERVAL_SECONDS:
+            packets.append(build_goal_control_packet(expected_revision, expected_goal_seq, ROSM_GOAL_CTRL_RESUME))
+            self.last_command_time = now
+            self.status = "resume_pending"
+            return packets
+
+        if (now - self.last_command_time) >= GOAL_COMMAND_RETRY_INTERVAL_SECONDS:
+            packets.append(
+                build_goal_set_packet(
+                    expected_revision,
+                    expected_goal_seq,
+                    current_goal["x_cm"],
+                    current_goal["y_cm"],
+                    GOAL_DEFAULT_TOLERANCE_CM,
+                )
+            )
+            self.last_command_time = now
+            self.status = "goal_dispatch" if telemetry_stale or not goal_matches else "goal_set_pending"
+
+        return packets
+
+    def update(self, control_state: dict, telemetry: dict, now: float):
+        route_action_consumed = self._apply_route_action(control_state)
+        self._capture_stm32_state(telemetry)
+        self._handle_goal_event()
+        packets = self._dispatch_packets(telemetry, now)
+        current_goal = self._current_goal()
+        remaining_queue = [dict(waypoint) for waypoint in self.mission_waypoints[self.active_goal_index :]]
+
+        return {
+            "route_action_consumed": route_action_consumed,
+            "packets": packets,
+            "mission_route_revision": int(self.route_revision),
+            "mission_status": self.status,
+            "mission_queue": [dict(waypoint) for waypoint in self.mission_waypoints],
+            "mission_remaining_queue": remaining_queue,
+            "active_waypoint_index": int(current_goal["index"]) if current_goal is not None else -1,
+            "route_size": int(len(self.mission_waypoints)),
+            "current_waypoint_label": str(current_goal["label"]) if current_goal is not None else "--",
+            "planner_goal": dict(current_goal) if current_goal is not None else None,
+            "planner_path": self._remaining_path(telemetry),
+            "planner_status": self.status,
+            "planner_path_age_s": 0.0,
+            "goal_route_revision": int(self.stm_goal_route_revision),
+            "goal_seq": int(self.stm_goal_seq),
+            "goal_state": self.stm_goal_state,
+            "goal_event_counter": int(self.stm_goal_event_counter),
+            "goal_loaded": bool(self.stm_goal_loaded),
+            "goal_paused": bool(self.stm_goal_paused),
+        }
 
 
 class DStarLitePlanner:
@@ -1374,17 +1778,25 @@ def parse_telemetry_packet(packet: bytes):
         x_cm = int.from_bytes(packet[2:4], byteorder="little", signed=True)
         y_cm = int.from_bytes(packet[4:6], byteorder="little", signed=True)
         yaw_tenths = int.from_bytes(packet[6:8], byteorder="little", signed=True)
-        sound_distance = int.from_bytes(packet[12:14], byteorder="little", signed=True)
-        sound_bearing = int.from_bytes(packet[14:16], byteorder="little", signed=True)
+        sound_flags = int(packet[13])
+        sound_distance = int.from_bytes(packet[14:16], byteorder="little", signed=True)
+        sound_bearing = int.from_bytes(packet[16:18], byteorder="little", signed=True)
+        goal_state_code = int(packet[10])
         return {
             "x_cm": float(x_cm),
             "y_cm": float(y_cm),
             "yaw_deg": round(yaw_tenths / 10.0, 1),
-            "active_waypoint_index": int(packet[8]),
-            "route_size": int(packet[9]),
+            "goal_route_revision": int(packet[8]),
+            "goal_seq": int(packet[9]),
+            "goal_state_code": goal_state_code,
+            "goal_state": GOAL_STATE_MAP.get(goal_state_code, f"unknown_{goal_state_code}"),
+            "goal_event_counter": int(packet[11]),
+            "goal_tolerance_cm": int(packet[12]),
+            "goal_loaded": bool(packet[18]),
+            "goal_paused": bool(packet[19]),
             "sound": {
-                "valid": bool(packet[10]),
-                "drone_detected": bool(packet[11]),
+                "valid": bool(sound_flags & 0x01),
+                "drone_detected": bool(sound_flags & 0x02),
                 "distance_cm": int(sound_distance),
                 "bearing_deg": round(sound_bearing / 10.0, 1),
                 "horizontal_source": None,
@@ -1399,6 +1811,9 @@ def parse_telemetry_packet(packet: bytes):
 class TelemetryParser:
     def __init__(self):
         self.buffer = bytearray()
+
+    def reset(self):
+        self.buffer.clear()
 
     def push(self, chunk: bytes):
         packets = []
@@ -1430,6 +1845,61 @@ class TelemetryParser:
             del self.buffer[0]
 
         return packets
+
+
+def open_command_serial():
+    try:
+        return serial.Serial(
+            port=SERIAL_PORT,
+            baudrate=SERIAL_BAUDRATE,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=0.02,
+            xonxoff=False,
+            rtscts=False,
+            dsrdtr=False,
+        )
+    except serial.SerialException as exc:
+        print(f"Command UART unavailable: {exc}")
+        return None
+
+
+def close_command_serial(ser):
+    if ser is None:
+        return
+    try:
+        ser.close()
+    except serial.SerialException:
+        pass
+
+
+def safe_serial_read(ser, telemetry_parser: TelemetryParser):
+    if ser is None:
+        return None, b""
+
+    try:
+        incoming = ser.read(ser.in_waiting or 1)
+        return ser, incoming
+    except serial.SerialException as exc:
+        print(f"Command UART read error: {exc}")
+        close_command_serial(ser)
+        telemetry_parser.reset()
+        return None, b""
+
+
+def safe_serial_write(ser, payload: bytes, telemetry_parser: TelemetryParser, label: str):
+    if ser is None or not payload:
+        return ser, False
+
+    try:
+        ser.write(payload)
+        return ser, True
+    except serial.SerialException as exc:
+        print(f"Command UART write error ({label}): {exc}")
+        close_command_serial(ser)
+        telemetry_parser.reset()
+        return None, False
 
 
 def get_aruco_detector():
@@ -1557,8 +2027,8 @@ def main():
     last_camera_publish_time = 0.0
     last_telemetry_publish_time = 0.0
     last_headless_status_print_time = 0.0
-    last_route_update_id = -1
     lidar_reader = LidarReader()
+    mission_controller = MissionQueueController()
     planner = JetsonRoutePlanner()
     latest_telemetry = {
         "robot_state": STATE_MANUAL,
@@ -1567,6 +2037,17 @@ def main():
         "y_cm": 0.0,
         "active_waypoint_index": -1,
         "route_size": 0,
+        "mission_route_revision": 0,
+        "mission_status": "idle",
+        "mission_queue": [],
+        "mission_remaining_queue": [],
+        "goal_route_revision": 0,
+        "goal_seq": 0,
+        "goal_state": "idle",
+        "goal_event_counter": 0,
+        "goal_loaded": False,
+        "goal_paused": False,
+        "command_uart_connected": False,
         "sound": {"valid": False, "drone_detected": False, "distance_cm": None, "bearing_deg": None},
         "lidar_scan": [None] * 360,
         "lidar_scan_timestamp": 0.0,
@@ -1597,17 +2078,8 @@ def main():
         print(f"MQTT disabled: {exc}")
         mqtt_client = None
 
-    ser = serial.Serial(
-        port=SERIAL_PORT,
-        baudrate=SERIAL_BAUDRATE,
-        bytesize=serial.EIGHTBITS,
-        parity=serial.PARITY_NONE,
-        stopbits=serial.STOPBITS_ONE,
-        timeout=0.02,
-        xonxoff=False,
-        rtscts=False,
-        dsrdtr=False,
-    )
+    ser = open_command_serial()
+    next_serial_retry_time = 0.0 if ser is None else time.time()
 
     aiming_cap = open_camera_capture(AIMING_CAMERA_INDEX, "aiming", required=True)
     aux_cap = open_camera_capture(AUX_CAMERA_INDEX, "auxiliary", required=False)
@@ -1643,7 +2115,16 @@ def main():
                     aux_frame = None
                     next_aux_retry_time = now + AUX_CAMERA_RETRY_SECONDS
 
-            incoming = ser.read(ser.in_waiting or 1)
+            if ser is None and now >= next_serial_retry_time:
+                ser = open_command_serial()
+                next_serial_retry_time = now + SERIAL_RECONNECT_INTERVAL_SECONDS
+                if ser is not None:
+                    telemetry_parser.reset()
+                    print(f"Command UART connected on {SERIAL_PORT} @ {SERIAL_BAUDRATE}")
+
+            ser, incoming = safe_serial_read(ser, telemetry_parser)
+            if ser is None:
+                next_serial_retry_time = min(next_serial_retry_time, now + SERIAL_RECONNECT_INTERVAL_SECONDS)
             active_control = command_state.get()
 
             for packet in telemetry_parser.push(incoming):
@@ -1678,9 +2159,43 @@ def main():
             active_target = choose_active_target(target_records, selected_target_id)
             lidar_scan_snapshot, lidar_scan_timestamp = lidar_reader.get_scan_snapshot_with_timestamp()
             obstacle_flags = compute_obstacle_flags(lidar_scan_snapshot)
-            planner_update = planner.update(active_control, latest_telemetry, lidar_scan_snapshot, now)
+            mission_update = mission_controller.update(active_control, latest_telemetry, now)
+            if mission_update.get("route_action_consumed"):
+                command_state.clear_route_action()
+            for goal_packet in mission_update.get("packets", []):
+                ser, _ = safe_serial_write(ser, goal_packet, telemetry_parser, "goal_packet")
+                if ser is None:
+                    next_serial_retry_time = now + SERIAL_RECONNECT_INTERVAL_SECONDS
+                    break
+
+            if PLANNER_ENABLED:
+                planner_update = planner.update(active_control, latest_telemetry, lidar_scan_snapshot, now)
+            else:
+                planner_update = {
+                    "planner_enabled": False,
+                    "planner_goal": mission_update.get("planner_goal"),
+                    "planner_path": mission_update.get("planner_path", []),
+                    "planner_status": mission_update.get("planner_status", "idle"),
+                    "planner_path_age_s": mission_update.get("planner_path_age_s", 0.0),
+                    "planner_obstacle_count": 0,
+                    "route_packets": [],
+                }
             latest_telemetry.update(
                 {
+                    "mission_route_revision": mission_update.get("mission_route_revision", latest_telemetry.get("mission_route_revision", 0)),
+                    "mission_status": mission_update.get("mission_status", latest_telemetry.get("mission_status", "idle")),
+                    "mission_queue": mission_update.get("mission_queue", latest_telemetry.get("mission_queue", [])),
+                    "mission_remaining_queue": mission_update.get("mission_remaining_queue", latest_telemetry.get("mission_remaining_queue", [])),
+                    "active_waypoint_index": mission_update.get("active_waypoint_index", latest_telemetry.get("active_waypoint_index", -1)),
+                    "route_size": mission_update.get("route_size", latest_telemetry.get("route_size", 0)),
+                    "current_waypoint_label": mission_update.get("current_waypoint_label", latest_telemetry.get("current_waypoint_label", "--")),
+                    "goal_route_revision": mission_update.get("goal_route_revision", latest_telemetry.get("goal_route_revision", 0)),
+                    "goal_seq": mission_update.get("goal_seq", latest_telemetry.get("goal_seq", 0)),
+                    "goal_state": mission_update.get("goal_state", latest_telemetry.get("goal_state", "idle")),
+                    "goal_event_counter": mission_update.get("goal_event_counter", latest_telemetry.get("goal_event_counter", 0)),
+                    "goal_loaded": mission_update.get("goal_loaded", latest_telemetry.get("goal_loaded", False)),
+                    "goal_paused": mission_update.get("goal_paused", latest_telemetry.get("goal_paused", False)),
+                    "command_uart_connected": bool(ser is not None),
                     "planner_enabled": planner_update.get("planner_enabled", bool(PLANNER_ENABLED)),
                     "planner_goal": planner_update.get("planner_goal"),
                     "planner_path": planner_update.get("planner_path", []),
@@ -1690,21 +2205,12 @@ def main():
                     "lidar_scan_timestamp": float(lidar_scan_timestamp),
                 }
             )
-
-            if active_control.get("route_update_id", -1) != last_route_update_id:
-                route_packets = planner_update.get("route_packets", []) if PLANNER_ENABLED else build_route_packets(active_control)
-                if (not route_packets) and (not PLANNER_ENABLED):
-                    route_packets = build_route_packets(active_control)
-                if (not route_packets) and PLANNER_ENABLED and str(active_control.get("route_action", "none")).strip().lower() != "none":
-                    route_packets = build_route_packets(active_control)
-                for route_packet in route_packets:
-                    ser.write(route_packet)
-                last_route_update_id = active_control.get("route_update_id", -1)
-                if route_packets:
-                    command_state.clear_route_action()
-            elif planner_update.get("route_packets"):
+            if PLANNER_ROUTE_CONTROL_ENABLED and planner_update.get("route_packets"):
                 for route_packet in planner_update["route_packets"]:
-                    ser.write(route_packet)
+                    ser, _ = safe_serial_write(ser, route_packet, telemetry_parser, "planner_route_packet")
+                    if ser is None:
+                        next_serial_retry_time = now + SERIAL_RECONNECT_INTERVAL_SECONDS
+                        break
 
             sent_this_frame = False
 
@@ -1761,8 +2267,9 @@ def main():
                         active_control,
                         reserved_flags=obstacle_flags,
                     )
-                    ser.write(packet)
-                    sent_this_frame = True
+                    ser, sent_this_frame = safe_serial_write(ser, packet, telemetry_parser, "tracking_control_packet")
+                    if ser is None:
+                        next_serial_retry_time = now + SERIAL_RECONNECT_INTERVAL_SECONDS
 
                 info_text = (
                     f"VISIBLE:{','.join(str(record['id']) for record in target_records)} "
@@ -1775,14 +2282,18 @@ def main():
 
             # Continuous UART fail-safe behavior: send default cx/cy when no target.
             if not sent_this_frame:
-                ser.write(build_uart_message(0, 0, OBJ_WIDTH, OBJ_HEIGHT, active_control, reserved_flags=obstacle_flags))
+                idle_packet = build_uart_message(0, 0, OBJ_WIDTH, OBJ_HEIGHT, active_control, reserved_flags=obstacle_flags)
+                ser, sent_this_frame = safe_serial_write(ser, idle_packet, telemetry_parser, "idle_control_packet")
+                if ser is None:
+                    next_serial_retry_time = now + SERIAL_RECONNECT_INTERVAL_SECONDS
 
             status_text = (
                 f"M:{active_control['movement_bits']:02X} "
                 f"T:{active_control['turret_bits']:02X} "
                 f"A:{active_control['aux_bits']:02X} "
                 f"{active_control['label']} "
-                f"SEL:{selected_target_id if selected_target_id is not None else 'AUTO'}"
+                f"SEL:{selected_target_id if selected_target_id is not None else 'AUTO'} "
+                f"UART:{'OK' if ser is not None else 'RETRY'}"
             )
             cv2.putText(frame, status_text, (40, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 255, 255), 2)
 
@@ -1795,6 +2306,20 @@ def main():
                             "target_count": len(target_records),
                             "selected_target_id": selected_target_id,
                             "active_target_id": active_target["id"] if active_target is not None else None,
+                            "mission_route_revision": mission_update.get("mission_route_revision", latest_telemetry.get("mission_route_revision", 0)),
+                            "mission_status": mission_update.get("mission_status", latest_telemetry.get("mission_status", "idle")),
+                            "mission_queue": mission_update.get("mission_queue", latest_telemetry.get("mission_queue", [])),
+                            "mission_remaining_queue": mission_update.get("mission_remaining_queue", latest_telemetry.get("mission_remaining_queue", [])),
+                            "active_waypoint_index": mission_update.get("active_waypoint_index", latest_telemetry.get("active_waypoint_index", -1)),
+                            "route_size": mission_update.get("route_size", latest_telemetry.get("route_size", 0)),
+                            "current_waypoint_label": mission_update.get("current_waypoint_label", latest_telemetry.get("current_waypoint_label", "--")),
+                            "goal_route_revision": mission_update.get("goal_route_revision", latest_telemetry.get("goal_route_revision", 0)),
+                            "goal_seq": mission_update.get("goal_seq", latest_telemetry.get("goal_seq", 0)),
+                            "goal_state": mission_update.get("goal_state", latest_telemetry.get("goal_state", "idle")),
+                            "goal_event_counter": mission_update.get("goal_event_counter", latest_telemetry.get("goal_event_counter", 0)),
+                            "goal_loaded": mission_update.get("goal_loaded", latest_telemetry.get("goal_loaded", False)),
+                            "goal_paused": mission_update.get("goal_paused", latest_telemetry.get("goal_paused", False)),
+                            "command_uart_connected": bool(ser is not None),
                             "lidar_scan": lidar_scan_snapshot,
                             "lidar_scan_timestamp": float(lidar_scan_timestamp),
                             "planner_enabled": planner_update.get("planner_enabled", bool(PLANNER_ENABLED)),
@@ -1844,7 +2369,7 @@ def main():
             aux_cap.release()
         if not headless_mode:
             cv2.destroyAllWindows()
-        ser.close()
+        close_command_serial(ser)
         if mqtt_client is not None:
             mqtt_client.loop_stop()
             mqtt_client.disconnect()

@@ -107,6 +107,10 @@ PLANNER_BYPASS_FORWARD_CM = 170.0
 PLANNER_BYPASS_LATERAL_CM = 130.0
 PLANNER_BYPASS_CLEARANCE_CM = 85.0
 PLANNER_BYPASS_PATH_ANGLE_DEG = 24.0
+PLANNER_ROUTE_CONTROL_ENABLED = False
+
+ROUTE_PACKET_META_MAGIC = 0xA5
+ROUTE_PACKET_META_VERSION = 0x01
 
 STATE_MANUAL = "MANUAL"
 STATE_AUTO_PATROLLING = "AUTO_PATROLLING"
@@ -169,9 +173,19 @@ class CommandState:
     def set(self, value: dict):
         with self._lock:
             route_update_id = self._state.get("route_update_id", 0)
-            if value.get("route_action", "none") != "none":
+            route_action = str(value.get("route_action", "none")).strip().lower()
+            incoming_waypoints = value.get("waypoints", [])
+            if route_action != "none":
                 route_update_id += 1
-            next_state = dict(value)
+            next_state = dict(self._state)
+            next_state.update(value)
+            next_state["route_action"] = route_action
+            if route_action != "none":
+                next_state["waypoints"] = [dict(waypoint) for waypoint in incoming_waypoints]
+            elif incoming_waypoints:
+                next_state["waypoints"] = [dict(waypoint) for waypoint in incoming_waypoints]
+            else:
+                next_state["waypoints"] = [dict(waypoint) for waypoint in self._state.get("waypoints", [])]
             next_state["route_update_id"] = route_update_id
             self._state = next_state
 
@@ -182,6 +196,13 @@ class CommandState:
     def clear_route_action(self):
         with self._lock:
             self._state["route_action"] = "none"
+
+
+def build_route_packet_checksum(payload: bytes) -> int:
+    checksum = ROUTE_PACKET_META_MAGIC ^ ROUTE_PACKET_META_VERSION
+    for value in payload:
+        checksum ^= int(value) & 0xFF
+    return checksum & 0xFF
 
 
 class LidarReader:
@@ -494,6 +515,9 @@ def build_route_packet(command: int, index: int = 0, x_cm: int = 0, y_cm: int = 
     msg[4] = (x_cm >> 8) & 0xFF
     msg[5] = y_cm & 0xFF
     msg[6] = (y_cm >> 8) & 0xFF
+    msg[7] = ROUTE_PACKET_META_MAGIC
+    msg[8] = ROUTE_PACKET_META_VERSION
+    msg[9] = build_route_packet_checksum(msg[1:7])
     msg[14] = ROUTE_PACKET_END
     return bytes(msg)
 
@@ -1613,17 +1637,13 @@ def main():
             )
 
             if active_control.get("route_update_id", -1) != last_route_update_id:
-                route_packets = planner_update.get("route_packets", []) if PLANNER_ENABLED else build_route_packets(active_control)
-                if (not route_packets) and (not PLANNER_ENABLED):
-                    route_packets = build_route_packets(active_control)
-                if (not route_packets) and PLANNER_ENABLED and str(active_control.get("route_action", "none")).strip().lower() != "none":
-                    route_packets = build_route_packets(active_control)
+                route_packets = build_route_packets(active_control)
                 for route_packet in route_packets:
                     ser.write(route_packet)
                 last_route_update_id = active_control.get("route_update_id", -1)
                 if route_packets:
                     command_state.clear_route_action()
-            elif planner_update.get("route_packets"):
+            elif PLANNER_ROUTE_CONTROL_ENABLED and planner_update.get("route_packets"):
                 for route_packet in planner_update["route_packets"]:
                     ser.write(route_packet)
 
