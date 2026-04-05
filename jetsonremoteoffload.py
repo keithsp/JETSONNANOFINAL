@@ -40,6 +40,7 @@ LIDAR_SERIAL_BAUDRATE = 230400
 LIDAR_PACKET_LEN = 47
 LIDAR_POINTS_PER_PACKET = 12
 LIDAR_MAX_DISTANCE_CM = 700
+LIDAR_ANGLE_OFFSET_DEG = 90.0
 
 CONTROL_MSG_LEN = 15
 CONTROL_MSG_START = 0x30
@@ -76,25 +77,23 @@ ROSM_GOAL_CTRL_CANCEL = 0x01
 ROSM_GOAL_CTRL_PAUSE = 0x02
 ROSM_GOAL_CTRL_RESUME = 0x03
 ROSM_CAM_FLAG_OBS_VALID = 0x01
-ROSM_CAM_FLAG_OBS_BLOCKED = 0x02
-ROSM_CAM_FLAG_OBS_LEFT_CLEAR = 0x04
-ROSM_CAM_FLAG_OBS_RIGHT_CLEAR = 0x08
-ROSM_CAM_FLAG_OBS_PREFER_LEFT = 0x10
-ROSM_CAM_FLAG_OBS_LEFT_NEAR_WALL = 0x20
-ROSM_CAM_FLAG_OBS_LEFT_WALL_CLEAR = 0x40
+ROSM_CAM_FLAG_OBS_FRONT_BLOCKED = 0x02
+ROSM_CAM_FLAG_OBS_LEFT_BLOCKED = 0x04
+ROSM_CAM_FLAG_OBS_RIGHT_BLOCKED = 0x08
+ROSM_CAM_FLAG_OBS_FORWARD_CLEAR = 0x10
+ROSM_CAM_FLAG_OBS_LEFT_WALL_CLEAR = 0x20
+ROSM_CAM_FLAG_OBS_RIGHT_WALL_CLEAR = 0x40
 
 ROUTE_PACKET_LEN = 15
 ROUTE_PACKET_START = 0x30
 ROUTE_PACKET_END = 0x31
 FRONT_OBSTACLE_LIMIT_CM = 50
+SIDE_BLOCKED_LIMIT_CM = 50
+FORWARD_CLEAR_LIMIT_CM = 50
+WALL_CLEAR_LIMIT_CM = 80
 SIDE_CLEAR_LIMIT_CM = 140
-FRONT_OBSTACLE_DEGREES = tuple(range(0, 19))
-LEFT_CLEAR_DEGREES = tuple(range(25, 81))
-RIGHT_CLEAR_DEGREES = tuple(range(280, 336))
-LEFT_WALL_TRACK_DEGREES = tuple(range(70, 111))
-RIGHT_WALL_TRACK_DEGREES = tuple(range(250, 291))
-LEFT_WALL_NEAR_CM = 30
-LEFT_WALL_CLEAR_CM = 55
+OPEN_SPACE_MIN_POINTS = 5
+OPEN_SPACE_MIN_RATIO = 0.35
 
 PLANNER_ENABLED = False
 PLANNER_GRID_CELL_CM = 25.0
@@ -118,6 +117,21 @@ PLANNER_BYPASS_HOLD_SECONDS = 1.6
 PLANNER_ROUTE_CONTROL_ENABLED = False
 
 ROUTE_PACKET_META_MAGIC = 0xA5
+
+
+def sector_degrees(start_deg: int, end_deg: int) -> tuple[int, ...]:
+    start = int(start_deg) % 360
+    end = int(end_deg) % 360
+    if start <= end:
+        return tuple(range(start, end + 1))
+    return tuple(range(start, 360)) + tuple(range(0, end + 1))
+
+
+FRONT_OBSTACLE_DEGREES = sector_degrees(60, 120)
+LEFT_CLEAR_DEGREES = sector_degrees(121, 180)
+RIGHT_CLEAR_DEGREES = sector_degrees(0, 59)
+LEFT_WALL_TRACK_DEGREES = sector_degrees(160, 200)
+RIGHT_WALL_TRACK_DEGREES = sector_degrees(340, 20)
 ROUTE_PACKET_META_VERSION = 0x01
 GOAL_PACKET_META_MAGIC = 0x5A
 GOAL_PACKET_META_VERSION = 0x01
@@ -348,6 +362,7 @@ class LidarReader:
                     angle = (start_angle + (angle_span * index / (LIDAR_POINTS_PER_PACKET - 1))) % 360.0
                 else:
                     angle = start_angle % 360.0
+                angle = (angle + LIDAR_ANGLE_OFFSET_DEG) % 360.0
                 degree = int(round(angle)) % 360
                 self._scan[degree] = distance_cm
                 self._scan_time[degree] = now
@@ -668,45 +683,93 @@ def extract_valid_distances(scan, degree_indices):
     return distances
 
 
+def sector_open_metrics(scan, degree_indices, open_threshold_cm):
+    distances = extract_valid_distances(scan, degree_indices)
+    if not distances:
+        return {
+            "distances": [],
+            "open_distances": [],
+            "open_points": 0,
+            "total_points": 0,
+            "open_ratio": 0.0,
+            "mean_open_distance": 0.0,
+        }
+
+    open_distances = [distance_cm for distance_cm in distances if distance_cm >= int(open_threshold_cm)]
+    total_points = len(distances)
+    open_points = len(open_distances)
+    open_ratio = float(open_points) / float(total_points) if total_points > 0 else 0.0
+    mean_open_distance = (sum(open_distances) / len(open_distances)) if open_distances else 0.0
+    return {
+        "distances": distances,
+        "open_distances": open_distances,
+        "open_points": open_points,
+        "total_points": total_points,
+        "open_ratio": open_ratio,
+        "mean_open_distance": mean_open_distance,
+    }
+
+
+def sector_has_open_space(metrics) -> bool:
+    return (
+        int(metrics.get("open_points", 0)) >= OPEN_SPACE_MIN_POINTS and
+        float(metrics.get("open_ratio", 0.0)) >= OPEN_SPACE_MIN_RATIO
+    )
+
+
+def sector_is_blocked(distances, blocked_threshold_cm) -> bool:
+    return bool(distances) and min(distances) < int(blocked_threshold_cm)
+
+
 def lidar_degree_allowed_for_nav(degree: int) -> bool:
     try:
         degree = int(degree) % 360
     except (TypeError, ValueError):
         return False
-    return not (270 <= degree <= 359)
+    return not (0 <= degree <= 89)
 
 
 def compute_obstacle_flags(scan):
-    front_distances = extract_valid_distances(scan, FRONT_OBSTACLE_DEGREES)
-    left_distances = extract_valid_distances(scan, LEFT_CLEAR_DEGREES)
-    right_distances = extract_valid_distances(scan, RIGHT_CLEAR_DEGREES)
-    left_wall_distances = extract_valid_distances(scan, LEFT_WALL_TRACK_DEGREES)
+    front_metrics = sector_open_metrics(scan, FRONT_OBSTACLE_DEGREES, FORWARD_CLEAR_LIMIT_CM)
+    left_metrics = sector_open_metrics(scan, LEFT_CLEAR_DEGREES, SIDE_BLOCKED_LIMIT_CM)
+    right_metrics = sector_open_metrics(scan, RIGHT_CLEAR_DEGREES, SIDE_BLOCKED_LIMIT_CM)
+    left_wall_metrics = sector_open_metrics(scan, LEFT_WALL_TRACK_DEGREES, WALL_CLEAR_LIMIT_CM)
+    right_wall_metrics = sector_open_metrics(scan, RIGHT_WALL_TRACK_DEGREES, WALL_CLEAR_LIMIT_CM)
+    front_distances = front_metrics["distances"]
+    left_distances = left_metrics["distances"]
+    right_distances = right_metrics["distances"]
+    left_wall_distances = left_wall_metrics["distances"]
+    right_wall_distances = right_wall_metrics["distances"]
 
-    if not front_distances and not left_distances and not right_distances and not left_wall_distances:
+    if (
+        not front_distances and
+        not left_distances and
+        not right_distances and
+        not left_wall_distances and
+        not right_wall_distances
+    ):
         return 0
 
     flags = ROSM_CAM_FLAG_OBS_VALID
-    front_blocked = bool(front_distances) and min(front_distances) <= FRONT_OBSTACLE_LIMIT_CM
-    left_clear = bool(left_distances) and min(left_distances) >= SIDE_CLEAR_LIMIT_CM
-    right_clear = bool(right_distances) and min(right_distances) >= SIDE_CLEAR_LIMIT_CM
-    left_wall_near = bool(left_wall_distances) and min(left_wall_distances) <= LEFT_WALL_NEAR_CM
-    left_wall_clear = (not left_wall_distances) or (min(left_wall_distances) >= LEFT_WALL_CLEAR_CM)
+    front_blocked = sector_is_blocked(front_distances, FRONT_OBSTACLE_LIMIT_CM)
+    left_blocked = sector_is_blocked(left_distances, SIDE_BLOCKED_LIMIT_CM)
+    right_blocked = sector_is_blocked(right_distances, SIDE_BLOCKED_LIMIT_CM)
+    forward_clear = sector_has_open_space(front_metrics)
+    left_wall_clear = sector_has_open_space(left_wall_metrics)
+    right_wall_clear = sector_has_open_space(right_wall_metrics)
 
     if front_blocked:
-        flags |= ROSM_CAM_FLAG_OBS_BLOCKED
-    if left_clear:
-        flags |= ROSM_CAM_FLAG_OBS_LEFT_CLEAR
-    if right_clear:
-        flags |= ROSM_CAM_FLAG_OBS_RIGHT_CLEAR
-    if left_wall_near:
-        flags |= ROSM_CAM_FLAG_OBS_LEFT_NEAR_WALL
+        flags |= ROSM_CAM_FLAG_OBS_FRONT_BLOCKED
+    if left_blocked:
+        flags |= ROSM_CAM_FLAG_OBS_LEFT_BLOCKED
+    if right_blocked:
+        flags |= ROSM_CAM_FLAG_OBS_RIGHT_BLOCKED
+    if forward_clear:
+        flags |= ROSM_CAM_FLAG_OBS_FORWARD_CLEAR
     if left_wall_clear:
         flags |= ROSM_CAM_FLAG_OBS_LEFT_WALL_CLEAR
-
-    left_score = sum(left_distances) / len(left_distances) if left_distances else 0.0
-    right_score = sum(right_distances) / len(right_distances) if right_distances else 0.0
-    if left_score > (right_score + 15.0):
-        flags |= ROSM_CAM_FLAG_OBS_PREFER_LEFT
+    if right_wall_clear:
+        flags |= ROSM_CAM_FLAG_OBS_RIGHT_WALL_CLEAR
 
     return flags
 
