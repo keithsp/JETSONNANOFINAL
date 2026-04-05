@@ -128,10 +128,10 @@ def sector_degrees(start_deg: int, end_deg: int) -> Tuple[int, ...]:
 
 
 FRONT_OBSTACLE_DEGREES = sector_degrees(60, 120)
-LEFT_CLEAR_DEGREES = sector_degrees(121, 180)
-RIGHT_CLEAR_DEGREES = sector_degrees(0, 59)
-LEFT_WALL_TRACK_DEGREES = sector_degrees(160, 200)
-RIGHT_WALL_TRACK_DEGREES = sector_degrees(340, 20)
+RIGHT_CLEAR_DEGREES = sector_degrees(121, 180)
+LEFT_CLEAR_DEGREES = sector_degrees(0, 59)
+RIGHT_WALL_TRACK_DEGREES = RIGHT_CLEAR_DEGREES
+LEFT_WALL_TRACK_DEGREES = LEFT_CLEAR_DEGREES
 ROUTE_PACKET_META_VERSION = 0x01
 GOAL_PACKET_META_MAGIC = 0x5A
 GOAL_PACKET_META_VERSION = 0x01
@@ -192,6 +192,18 @@ RETRIEVAL_PRIORITY = (
     ("in", "RETRIEVAL_IN"),
     ("out", "RETRIEVAL_OUT"),
 )
+
+
+def create_mqtt_client():
+    try:
+        callback_api_version = mqtt.CallbackAPIVersion.VERSION2
+    except AttributeError:
+        callback_api_version = None
+
+    if callback_api_version is not None:
+        return mqtt.Client(callback_api_version)
+
+    return mqtt.Client()
 
 
 class CommandState:
@@ -759,6 +771,12 @@ def compute_obstacle_flags(scan):
     forward_clear = sector_has_open_space(front_metrics)
     left_wall_clear = sector_has_open_space(left_wall_metrics)
     right_wall_clear = sector_has_open_space(right_wall_metrics)
+
+    # Keep the front-sector decision self-consistent for the STM32 avoid-state machine.
+    # If we have enough open space to call the forward sector clear, do not also assert
+    # the front-blocked bit from a single close return in that same sector.
+    if forward_clear:
+        front_blocked = False
 
     if front_blocked:
         flags |= ROSM_CAM_FLAG_OBS_FRONT_BLOCKED
@@ -2124,24 +2142,35 @@ def main():
         "planner_obstacle_count": 0,
     }
 
-    def on_connect(client, userdata, flags, reason_code, properties):
-        print(f"MQTT connected, reason code: {reason_code}")
+    def on_connect(client, userdata, flags, reason_code, properties=None):
+        print(f"MQTT connected to {MQTT_BROKER}:{MQTT_PORT}, reason code: {reason_code}")
         client.subscribe(MQTT_TOPIC_COMMAND)
 
     def on_message(client, userdata, msg):
         payload_text = msg.payload.decode("utf-8", errors="ignore")
         command_state.set(parse_command_text(payload_text))
 
-    mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-    mqtt_client.on_connect = on_connect
-    mqtt_client.on_message = on_message
+    def on_disconnect(client, userdata, *args):
+        reason_code = args[1] if len(args) >= 2 else (args[0] if len(args) >= 1 else "unknown")
+        print(f"MQTT disconnected from {MQTT_BROKER}:{MQTT_PORT}, reason code: {reason_code}")
 
+    mqtt_client = None
     try:
-        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        mqtt_client.loop_start()
-    except OSError as exc:
-        print(f"MQTT disabled: {exc}")
-        mqtt_client = None
+        mqtt_client = create_mqtt_client()
+    except Exception as exc:
+        print(f"MQTT client creation failed: {exc}")
+
+    if mqtt_client is not None:
+        mqtt_client.on_connect = on_connect
+        mqtt_client.on_message = on_message
+        mqtt_client.on_disconnect = on_disconnect
+
+        try:
+            mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+            mqtt_client.loop_start()
+        except Exception as exc:
+            print(f"MQTT disabled ({MQTT_BROKER}:{MQTT_PORT}): {exc}")
+            mqtt_client = None
 
     ser = open_command_serial()
     next_serial_retry_time = 0.0 if ser is None else time.time()
