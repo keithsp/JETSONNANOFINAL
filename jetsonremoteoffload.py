@@ -5,7 +5,7 @@ import math
 import os
 import threading
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import cv2
 import paho.mqtt.client as mqtt
@@ -119,7 +119,7 @@ PLANNER_ROUTE_CONTROL_ENABLED = False
 ROUTE_PACKET_META_MAGIC = 0xA5
 
 
-def sector_degrees(start_deg: int, end_deg: int) -> tuple[int, ...]:
+def sector_degrees(start_deg: int, end_deg: int) -> Tuple[int, ...]:
     start = int(start_deg) % 360
     end = int(end_deg) % 360
     if start <= end:
