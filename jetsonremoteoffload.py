@@ -884,6 +884,13 @@ class MissionQueueController:
     def _goal_matches_stm32(self, route_revision: int, goal_seq: int) -> bool:
         return (self.stm_goal_route_revision == (int(route_revision) & 0xFF)) and (self.stm_goal_seq == (int(goal_seq) & 0xFF))
 
+    def _has_goal_to_cancel(self, current_goal: dict | None) -> bool:
+        if current_goal is not None:
+            return True
+        if self.stm_goal_loaded:
+            return True
+        return self.stm_goal_state not in {"idle", "cancelled"}
+
     def _apply_route_action(self, control_state: dict) -> bool:
         route_action = str(control_state.get("route_action", "none")).strip().lower()
         try:
@@ -899,6 +906,7 @@ class MissionQueueController:
 
         if route_action == "replace_queue":
             current_goal = self._current_goal()
+            had_goal_to_cancel = self._has_goal_to_cancel(current_goal)
             try:
                 next_revision = int(control_state.get("route_revision", ((self.route_revision + 1) & 0xFF) or 1)) & 0xFF
             except (TypeError, ValueError):
@@ -907,14 +915,23 @@ class MissionQueueController:
             self.mission_waypoints = waypoints
             self.active_goal_index = 0
             self.paused = False
-            self.cancel_requested = not bool(self.mission_waypoints)
+            self.cancel_requested = had_goal_to_cancel
             if current_goal is not None:
                 self.cancel_goal_revision = int(current_goal["route_revision"]) & 0xFF
                 self.cancel_goal_seq = int(current_goal["index"]) & 0xFF
                 self.cancel_has_target = True
-            elif self.mission_waypoints:
+            elif had_goal_to_cancel:
+                self.cancel_goal_revision = int(self.stm_goal_route_revision) & 0xFF
+                self.cancel_goal_seq = int(self.stm_goal_seq) & 0xFF
+                self.cancel_has_target = True
+            else:
                 self.cancel_has_target = False
-            self.status = "goal_dispatch" if self.mission_waypoints else "cancel_pending"
+            if self.cancel_requested:
+                self.status = "cancel_pending"
+            elif self.mission_waypoints:
+                self.status = "goal_dispatch"
+            else:
+                self.status = "idle"
             self.last_command_time = 0.0
             return True
 
