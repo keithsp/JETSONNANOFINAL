@@ -773,10 +773,9 @@ def compute_obstacle_flags(scan):
     right_wall_clear = sector_has_open_space(right_wall_metrics)
 
     # Keep the front-sector decision self-consistent for the STM32 avoid-state machine.
-    # If we have enough open space to call the forward sector clear, do not also assert
-    # the front-blocked bit from a single close return in that same sector.
-    if forward_clear:
-        front_blocked = False
+    # A front obstacle should dominate; only call the sector clear when it is not blocked.
+    if front_blocked:
+        forward_clear = False
 
     if front_blocked:
         flags |= ROSM_CAM_FLAG_OBS_FRONT_BLOCKED
