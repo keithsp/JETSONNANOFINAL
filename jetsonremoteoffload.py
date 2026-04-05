@@ -884,7 +884,7 @@ class MissionQueueController:
     def _goal_matches_stm32(self, route_revision: int, goal_seq: int) -> bool:
         return (self.stm_goal_route_revision == (int(route_revision) & 0xFF)) and (self.stm_goal_seq == (int(goal_seq) & 0xFF))
 
-    def _has_goal_to_cancel(self, current_goal: dict | None) -> bool:
+    def _has_goal_to_cancel(self, current_goal) -> bool:
         if current_goal is not None:
             return True
         if self.stm_goal_loaded:
