@@ -127,7 +127,7 @@ def sector_degrees(start_deg: int, end_deg: int) -> Tuple[int, ...]:
     return tuple(range(start, 360)) + tuple(range(0, end + 1))
 
 
-FRONT_OBSTACLE_DEGREES = sector_degrees(320, 40)
+FRONT_OBSTACLE_DEGREES = sector_degrees(322, 40)
 RIGHT_CLEAR_DEGREES = sector_degrees(41, 90)
 LEFT_CLEAR_DEGREES = sector_degrees(270, 321)
 RIGHT_WALL_TRACK_DEGREES = RIGHT_CLEAR_DEGREES
