@@ -40,7 +40,7 @@ LIDAR_SERIAL_BAUDRATE = 230400
 LIDAR_PACKET_LEN = 47
 LIDAR_POINTS_PER_PACKET = 12
 LIDAR_MAX_DISTANCE_CM = 700
-LIDAR_ANGLE_OFFSET_DEG = 0.0
+LIDAR_ANGLE_OFFSET_DEG = 90.0
 
 CONTROL_MSG_LEN = 15
 CONTROL_MSG_START = 0x30
@@ -2000,10 +2000,18 @@ def get_aruco_detector():
 
 
 def detect_markers(frame, aruco, dictionary, params, detector):
-    if detector is not None:
-        corners, ids, _ = detector.detectMarkers(frame)
+    if frame is None:
+        return None, None
+
+    if len(frame.shape) == 3 and frame.shape[2] >= 3:
+        detect_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     else:
-        corners, ids, _ = aruco.detectMarkers(frame, dictionary, parameters=params)
+        detect_frame = frame
+
+    if detector is not None:
+        corners, ids, _ = detector.detectMarkers(detect_frame)
+    else:
+        corners, ids, _ = aruco.detectMarkers(detect_frame, dictionary, parameters=params)
     return corners, ids
 
 
@@ -2196,17 +2204,11 @@ def main():
 
             aux_frame = None
             now = time.time()
-            if aux_cap is None and now >= next_aux_retry_time:
-                aux_cap = open_camera_capture(AUX_CAMERA_INDEX, "auxiliary", required=False)
-                next_aux_retry_time = now + AUX_CAMERA_RETRY_SECONDS
-            if aux_cap is not None:
-                aux_ok, aux_frame = aux_cap.read()
-                if not aux_ok or aux_frame is None:
-                    print("Warning: Auxiliary camera frame grab failed. Retrying...")
-                    aux_cap.release()
-                    aux_cap = None
-                    aux_frame = None
-                    next_aux_retry_time = now + AUX_CAMERA_RETRY_SECONDS
+            should_publish_camera = (
+                mqtt_client is not None and
+                (now - last_camera_publish_time) >= (1.0 / CAMERA_STREAM_FPS)
+            )
+            should_render_frame = (False == headless_mode) or should_publish_camera
 
             if ser is None and now >= next_serial_retry_time:
                 ser = open_command_serial()
@@ -2229,22 +2231,6 @@ def main():
                 latest_telemetry.update({key: value for key, value in telemetry.items() if key != "sound"})
 
             screen_center = (frame.shape[1] / 2.0, frame.shape[0] / 2.0)
-
-            cv2.circle(frame, (int(screen_center[0]), int(screen_center[1])), 6, (0, 255, 255), -1)
-            cv2.line(
-                frame,
-                (int(screen_center[0] - 20), int(screen_center[1])),
-                (int(screen_center[0] + 20), int(screen_center[1])),
-                (0, 255, 255),
-                2,
-            )
-            cv2.line(
-                frame,
-                (int(screen_center[0]), int(screen_center[1] - 20)),
-                (int(screen_center[0]), int(screen_center[1] + 20)),
-                (0, 255, 255),
-                2,
-            )
 
             marker_corners, marker_ids = detect_markers(frame, aruco, dictionary, params, detector)
             target_records = build_target_records(marker_corners, marker_ids)
@@ -2307,49 +2293,67 @@ def main():
 
             sent_this_frame = False
 
+            if should_render_frame:
+                cv2.circle(frame, (int(screen_center[0]), int(screen_center[1])), 6, (0, 255, 255), -1)
+                cv2.line(
+                    frame,
+                    (int(screen_center[0] - 20), int(screen_center[1])),
+                    (int(screen_center[0] + 20), int(screen_center[1])),
+                    (0, 255, 255),
+                    2,
+                )
+                cv2.line(
+                    frame,
+                    (int(screen_center[0]), int(screen_center[1] - 20)),
+                    (int(screen_center[0]), int(screen_center[1] + 20)),
+                    (0, 255, 255),
+                    2,
+                )
+
             if target_records:
-                for i, record in enumerate(target_records):
-                    corners = record["corners"].astype(int)
-                    is_selected = selected_target_id is not None and record["id"] == selected_target_id
-                    is_active = active_target is not None and record["id"] == active_target["id"]
+                if should_render_frame:
+                    for i, record in enumerate(target_records):
+                        corners = record["corners"].astype(int)
+                        is_selected = selected_target_id is not None and record["id"] == selected_target_id
+                        is_active = active_target is not None and record["id"] == active_target["id"]
 
-                    color = (0, 180, 255)
-                    if is_selected and is_active:
-                        color = (0, 255, 0)
-                    elif is_active:
-                        color = (0, 255, 255)
-                    elif is_selected:
-                        color = (255, 0, 255)
+                        color = (0, 180, 255)
+                        if is_selected and is_active:
+                            color = (0, 255, 0)
+                        elif is_active:
+                            color = (0, 255, 255)
+                        elif is_selected:
+                            color = (255, 0, 255)
 
-                    for idx in range(4):
-                        start = tuple(corners[idx])
-                        end = tuple(corners[(idx + 1) % 4])
-                        cv2.line(frame, start, end, color, 2)
+                        for idx in range(4):
+                            start = tuple(corners[idx])
+                            end = tuple(corners[(idx + 1) % 4])
+                            cv2.line(frame, start, end, color, 2)
 
-                    cv2.circle(frame, (record["cx"], record["cy"]), 8, color, -1)
-                    label = f"ID:{record['id']}"
-                    if is_active:
-                        label += " ACTIVE"
-                    elif is_selected:
-                        label += " SELECTED"
-                    cv2.putText(
-                        frame,
-                        label,
-                        (record["cx"] + 10, record["cy"] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        color,
-                        2,
-                    )
-
-                    if active_target is not None and record["id"] == active_target["id"]:
-                        cv2.line(
+                        cv2.circle(frame, (record["cx"], record["cy"]), 8, color, -1)
+                        label = f"ID:{record['id']}"
+                        if is_active:
+                            label += " ACTIVE"
+                        elif is_selected:
+                            label += " SELECTED"
+                        cv2.putText(
                             frame,
-                            (int(screen_center[0]), int(screen_center[1])),
-                            (record["cx"], record["cy"]),
+                            label,
+                            (record["cx"] + 10, record["cy"] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55,
                             color,
                             2,
                         )
+
+                        if active_target is not None and record["id"] == active_target["id"]:
+                            cv2.line(
+                                frame,
+                                (int(screen_center[0]), int(screen_center[1])),
+                                (record["cx"], record["cy"]),
+                                color,
+                                2,
+                            )
 
                 if active_target is not None:
                     packet = build_uart_message(
@@ -2369,8 +2373,9 @@ def main():
                     f"SEL:{selected_target_id if selected_target_id is not None else 'AUTO'} "
                     f"ACT:{active_target['id'] if active_target is not None else '--'}"
                 )
-                cv2.putText(frame, info_text, (40, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
-            else:
+                if should_render_frame:
+                    cv2.putText(frame, info_text, (40, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+            elif should_render_frame:
                 cv2.putText(frame, "No markers detected", (40, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             # Continuous UART fail-safe behavior: send default cx/cy when no target.
@@ -2388,7 +2393,8 @@ def main():
                 f"SEL:{selected_target_id if selected_target_id is not None else 'AUTO'} "
                 f"UART:{'OK' if ser is not None else 'RETRY'}"
             )
-            cv2.putText(frame, status_text, (40, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 255, 255), 2)
+            if should_render_frame:
+                cv2.putText(frame, status_text, (40, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 255, 255), 2)
 
             if mqtt_client is not None:
                 if now - last_telemetry_publish_time >= TELEMETRY_PUBLISH_INTERVAL_SECONDS:
@@ -2426,7 +2432,19 @@ def main():
                     mqtt_client.publish(MQTT_TOPIC_TELEMETRY, json.dumps(telemetry_snapshot))
                     last_telemetry_publish_time = now
 
-                if now - last_camera_publish_time >= (1.0 / CAMERA_STREAM_FPS):
+                if should_publish_camera:
+                    if aux_cap is None and now >= next_aux_retry_time:
+                        aux_cap = open_camera_capture(AUX_CAMERA_INDEX, "auxiliary", required=False)
+                        next_aux_retry_time = now + AUX_CAMERA_RETRY_SECONDS
+                    if aux_cap is not None:
+                        aux_ok, aux_frame = aux_cap.read()
+                        if not aux_ok or aux_frame is None:
+                            print("Warning: Auxiliary camera frame grab failed. Retrying...")
+                            aux_cap.release()
+                            aux_cap = None
+                            aux_frame = None
+                            next_aux_retry_time = now + AUX_CAMERA_RETRY_SECONDS
+
                     camera_payload = encode_camera_frame(frame)
                     if camera_payload is not None:
                         mqtt_client.publish(MQTT_TOPIC_CAMERA, camera_payload)
